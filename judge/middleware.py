@@ -3,18 +3,20 @@ import logging
 import random
 import json
 from datetime import datetime
+from urllib.parse import quote
 
 from django.conf import settings
-from django.http import HttpResponseRedirect, Http404
+from django.contrib.auth import logout
+from django.http import HttpResponseRedirect
 from django.urls import Resolver404, resolve, reverse
-from django.utils.http import urlquote
 from django.contrib.sites.shortcuts import get_current_site
 from django.core.exceptions import ObjectDoesNotExist
 from django.utils.translation import gettext as _
+from django.contrib.auth.models import User
 
-from judge.models import Organization
+from judge.models import Organization, Course, Language, Profile
 from judge.utils.views import generic_message
-
+from judge.cache_handler import clear_request_l0_cache
 
 USED_DOMAINS = ["www"]
 URL_NAMES_BYPASS_SUBDOMAIN = ["submission_source_file"]
@@ -37,13 +39,34 @@ class ShortCircuitMiddleware:
         return self.get_response(request)
 
 
+class InactiveUserLogoutMiddleware(object):
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        user = getattr(request, "user", None)
+        if user is not None and user.is_authenticated and not user.is_active:
+            logout(request)
+        return self.get_response(request)
+
+
 class DMOJLoginMiddleware(object):
     def __init__(self, get_response):
         self.get_response = get_response
 
     def __call__(self, request):
         if request.user.is_authenticated:
-            profile = request.profile = request.user.profile
+            try:
+                profile = request.profile = request.user.profile
+            except User.profile.RelatedObjectDoesNotExist:
+                profile, _ = Profile.objects.get_or_create(
+                    user=request.user,
+                    defaults={
+                        "language": Language.get_default_language(),
+                    },
+                )
+                request.profile = profile
+
             login_2fa_path = reverse("login_2fa")
             if (
                 profile.is_totp_enabled
@@ -52,7 +75,7 @@ class DMOJLoginMiddleware(object):
                 and not request.path.startswith(settings.STATIC_URL)
             ):
                 return HttpResponseRedirect(
-                    login_2fa_path + "?next=" + urlquote(request.get_full_path())
+                    login_2fa_path + "?next=" + quote(request.get_full_path())
                 )
         else:
             request.profile = None
@@ -80,11 +103,9 @@ class ContestMiddleware(object):
             profile.update_contest()
             request.participation = profile.current_contest
             request.in_contest = request.participation is not None
-            request.contest_mode = request.session.get("contest_mode", True)
         else:
             request.in_contest = False
             request.participation = None
-        request.in_contest_mode = request.in_contest and request.contest_mode
         return self.get_response(request)
 
 
@@ -95,7 +116,7 @@ class DarkModeMiddleware(object):
     def __call__(self, request):
         if "darkmode" in request.GET:
             return HttpResponseRedirect(
-                reverse("toggle_darkmode") + "?next=" + urlquote(request.path)
+                reverse("toggle_darkmode") + "?next=" + quote(request.path)
             )
         return self.get_response(request)
 
@@ -138,7 +159,7 @@ class SubdomainMiddleware(object):
                     )
                 if not request.GET.get("next", None):
                     return HttpResponseRedirect(
-                        reverse("auth_login") + "?next=" + urlquote(request.path)
+                        reverse("auth_login") + "?next=" + quote(request.path)
                     )
         except ObjectDoesNotExist:
             return generic_message(
@@ -147,6 +168,31 @@ class SubdomainMiddleware(object):
                 _("No such group"),
                 status=404,
             )
+        return self.get_response(request)
+
+
+class CourseMiddleware(object):
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        request.course = None
+        try:
+            # Check if the URL is a course-related path
+            resolved = resolve(request.path)
+            if "slug" in resolved.kwargs and request.path.startswith("/course/"):
+                course_slug = resolved.kwargs["slug"]
+                try:
+                    course = Course.objects.get(slug=course_slug)
+                    # Only set request.course if user has access to the course
+                    # getattr handles the case where request.profile might not exist yet
+                    profile = getattr(request, "profile", None)
+                    if Course.is_accessible_by(course, profile):
+                        request.course = course
+                except Course.DoesNotExist:
+                    pass
+        except Resolver404:
+            pass
         return self.get_response(request)
 
 
@@ -177,4 +223,20 @@ class SlowRequestMiddleware(object):
                     logger.info(json.dumps(message))
             except Exception:
                 pass
+        return response
+
+
+class RequestScopedCacheMiddleware:
+    """
+    Middleware to clear request-scoped L0 cache at the end of each request.
+    This ensures that the L0 cache is only valid within a single request.
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        # Clear the request-scoped L0 cache after processing the request
+        clear_request_l0_cache()
         return response

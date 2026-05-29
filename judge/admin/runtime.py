@@ -1,4 +1,4 @@
-from django.conf.urls import url
+from django.urls import re_path
 from django.db.models import TextField
 from django.forms import ModelForm, ModelMultipleChoiceField, TextInput
 from django.http import HttpResponseRedirect
@@ -110,7 +110,6 @@ class JudgeAdmin(VersionAdmin):
         "load",
         "last_ip",
         "runtimes",
-        "problems",
     )
     fieldsets = (
         (None, {"fields": ("name", "auth_key", "is_blocked")}),
@@ -119,19 +118,19 @@ class JudgeAdmin(VersionAdmin):
             _("Information"),
             {"fields": ("created", "online", "last_ip", "start_time", "ping", "load")},
         ),
-        (_("Capabilities"), {"fields": ("runtimes", "problems")}),
+        (_("Capabilities"), {"fields": ("runtimes",)}),
     )
     list_display = ("name", "online", "start_time", "ping", "load", "last_ip")
     ordering = ["-online", "name"]
 
     def get_urls(self):
         return [
-            url(
+            re_path(
                 r"^(\d+)/disconnect/$",
                 self.disconnect_view,
                 name="judge_judge_disconnect",
             ),
-            url(
+            re_path(
                 r"^(\d+)/terminate/$", self.terminate_view, name="judge_judge_terminate"
             ),
         ] + super(JudgeAdmin, self).get_urls()

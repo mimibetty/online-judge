@@ -30,13 +30,17 @@ from judge.models.problem import (
     ProblemTranslation,
     ProblemType,
     Solution,
-    TranslatedProblemQuerySet,
     ProblemPointsVote,
 )
 from judge.models.problem_data import (
     CHECKERS,
+    CSV_CHECKER_KEYS,
     ProblemData,
     ProblemTestCase,
+    ProblemSignatureGrader,
+    ProblemValidation,
+    ProblemValidationResult,
+    ProblemSolutionCode,
     problem_data_storage,
     problem_directory_file,
 )
@@ -47,6 +51,8 @@ from judge.models.profile import (
     Friend,
     OrganizationProfile,
     ProfileInfo,
+    OrganizationModerationLog,
+    DYNAMIC_EFFECT_CHOICES,
 )
 from judge.models.runtime import Judge, Language, RuntimeVersion
 from judge.models.submission import (
@@ -56,20 +62,41 @@ from judge.models.submission import (
     SubmissionTestCase,
 )
 
-from judge.models.test_formatter import TestFormatterModel
 from judge.models.ticket import Ticket, TicketMessage
-from judge.models.volunteer import VolunteerProblemVote
 from judge.models.pagevote import PageVote, PageVoteVoter
-from judge.models.bookmark import BookMark, MakeBookMark
+from judge.models.bookmark import BookMark
 from judge.models.course import (
     Course,
     CourseRole,
     CourseLesson,
     CourseLessonProblem,
     CourseContest,
+    CourseLessonPrerequisite,
+    CourseLessonProgress,
+    BestSubmission,
+)
+from judge.models.quiz import (
+    QuizQuestion,
+    QuizQuestionType,
+    Quiz,
+    QuizQuestionAssignment,
+    CourseLessonQuiz,
+    QuizAttempt,
+    QuizAnswer,
+    QuizAnswerFile,
+    BestQuizAttempt,
 )
 from judge.models.notification import Notification, NotificationProfile
-from judge.models.test_formatter import TestFormatterModel
+from judge.models.block import Block
+from judge.models.email_change import EmailChangeRequest
+from judge.models.problem_attachment import ProblemAttachment
+from judge.models.problem_duplicate import (
+    ProblemDuplicateCandidate,
+    ProblemDuplicateMergeHistory,
+    ProblemDuplicateReport,
+    ProblemDuplicateReviewHistory,
+)
+from judge.models.public_request import PublicRequest
 
 revisions.register(Profile, exclude=["points", "last_access", "ip", "rating"])
 revisions.register(Problem, follow=["language_limits"])
@@ -90,10 +117,17 @@ revisions.register(ProblemPointsVote)
 revisions.register(ContestMoss)
 revisions.register(ProblemData)
 revisions.register(ProblemTestCase)
+revisions.register(ProblemSolutionCode)
 revisions.register(ContestParticipation)
 revisions.register(Rating)
 revisions.register(PageVoteVoter)
-revisions.register(VolunteerProblemVote)
-revisions.register(MakeBookMark)
 revisions.register(Course)
+revisions.register(Ticket)
+revisions.register(TicketMessage)
+revisions.register(QuizQuestion)
+revisions.register(Quiz)
+revisions.register(QuizQuestionAssignment)
+revisions.register(CourseLessonQuiz)
+revisions.register(QuizAttempt)
+revisions.register(QuizAnswer)
 del revisions

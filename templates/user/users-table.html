@@ -1,16 +1,21 @@
 {% extends "user/base-users-table.html" %}
 
+{% block row_extra %}
+  id="user-{{ user.username }}"
+{% endblock %}
+
 {% block after_rank_head %}
   <th></th>
 {% endblock %}
 
 {% block after_rank %}
-  <td><img loading="lazy" style="max-width: none;" class="user-img" src="{{ gravatar(user, 40) }}" height="40px" width="40px"></td>
+  <td><img loading="lazy" style="max-width: none;" class="user-img" src="{{ gravatar(user.id, 40) }}" height="40px" width="40px"></td>
 {% endblock %}
 
 {% block user_footer %}
-  <span style="margin-left: 0.5em">{% if user.rating %}{{ rating_number(user) }}{% endif %}</span>
-  <div class="gray" style="font-weight: 600; margin-top: 0.2em">{{ user.first_name or ''}}</div>
+  {% if user.rating %}
+    <span class="user-rating-badge">{{ rating_number(user) }}</span>
+  {% endif %}
 {% endblock %}
 
 {% block after_point_head %}
@@ -18,6 +23,11 @@
     {% if sort_links %}<a href="{{ sort_links.problem_count }}">{% endif %}
     {{ _('Problems') }}
     {%- if sort_links %}{{ sort_order.problem_count }}</a>{% endif %}
+  </th>
+  <th class="contribution">
+    {% if sort_links %}<a href="{{ sort_links.contribution_points }}">{% endif %}
+    {{ _('Contribution') }}
+    {%- if sort_links %}{{ sort_order.contribution_points }}</a>{% endif %}
   </th>
   <th class="about-column">{{ _('About') }}</th>
 {% endblock %}
@@ -37,13 +47,10 @@
 
 {% block after_point %}
   <td class="user-problem-count">{{ user.problem_count }}</td>
+  <td class="user-contribution">{{ user.contribution_points }}</td>
   <td>
     <div class="about-td">
-      {% cache 86400 'user_about' user.id %}
-        {% if user.about %}
-          {{ user.about|markdown(lazy_load=True)|reference|str|safe }}
-        {% endif %}
-      {% endcache %}
+      {% if user.about %}{{ user.about|markdown(lazy_load=True)|reference|str|safe }}{% endif %}
     </div>
   </td>
 {% endblock %}

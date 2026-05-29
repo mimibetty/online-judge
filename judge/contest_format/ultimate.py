@@ -2,7 +2,7 @@ from django.utils.translation import gettext_lazy
 
 from judge.contest_format.ioi import IOIContestFormat
 from judge.contest_format.registry import register_contest_format
-from django.db.models import Min, OuterRef, Subquery
+from django.db.models import OuterRef, Subquery
 
 # This contest format only counts last submission for each problem.
 
@@ -11,9 +11,7 @@ from django.db.models import Min, OuterRef, Subquery
 class UltimateContestFormat(IOIContestFormat):
     name = gettext_lazy("Ultimate")
 
-    def update_participation(self, participation):
-        cumtime = 0
-        score = 0
+    def gather_results(self, participation):
         format_data = {}
 
         queryset = participation.submissions
@@ -37,19 +35,11 @@ class UltimateContestFormat(IOIContestFormat):
         for problem_id, time, points in queryset:
             if self.config["cumtime"]:
                 dt = (time - participation.start).total_seconds()
-                if points:
-                    cumtime += dt
             else:
                 dt = 0
             format_data[str(problem_id)] = {
                 "time": dt,
                 "points": points,
             }
-            score += points
 
-        self.handle_frozen_state(participation, format_data)
-        participation.cumtime = max(cumtime, 0)
-        participation.score = round(score, self.contest.points_precision)
-        participation.tiebreaker = 0
-        participation.format_data = format_data
-        participation.save()
+        return format_data

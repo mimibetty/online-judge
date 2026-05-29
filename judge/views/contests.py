@@ -1,41 +1,44 @@
+import csv
+import io
 from copy import deepcopy
 import json
 import math
+import random
 from calendar import Calendar, SUNDAY
 from collections import defaultdict, namedtuple
 from datetime import date, datetime, time, timedelta
 from functools import partial
-from itertools import chain
 from operator import attrgetter, itemgetter
 
 from django import forms
 from django.conf import settings
+from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin, PermissionRequiredMixin
 from django.core.cache import cache
-from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist
-from django.db import IntegrityError
+from django.core.exceptions import (
+    ImproperlyConfigured,
+    ObjectDoesNotExist,
+    ValidationError,
+)
+from django.db import IntegrityError, transaction
 from django.db.models import (
     Case,
     Count,
-    F,
     FloatField,
     IntegerField,
     Max,
     Min,
+    Prefetch,
     Q,
-    Sum,
     Value,
     When,
 )
-from django.dispatch import receiver
 from django.db.models.expressions import CombinedExpression
 from django.http import (
     Http404,
     HttpResponse,
-    HttpResponseBadRequest,
     HttpResponseRedirect,
     JsonResponse,
-    HttpResponseNotAllowed,
 )
 from django.shortcuts import get_object_or_404, render
 from django.template.defaultfilters import date as date_filter
@@ -54,9 +57,17 @@ from django.views.generic.detail import (
     View,
 )
 
+from reversion import revisions
+
 from judge import event_poster as event
-from judge.views.comment import CommentedDetailView
-from judge.forms import ContestCloneForm
+from judge.views.comment import CommentableMixin
+from judge.forms import (
+    ContestCloneForm,
+    ContestEditForm,
+    ContestRowFormSet,
+    CONTEST_EDIT_FIELD_SECTIONS,
+)
+from judge.utils.contest import maybe_trigger_contest_rescore
 from judge.models import (
     Contest,
     ContestMoss,
@@ -71,28 +82,35 @@ from judge.models import (
     ContestsSummary,
     OfficialContestCategory,
     OfficialContestLocation,
+    Course,
+    CourseContest,
 )
+from judge.models.course import EDITABLE_ROLES
+from judge.models.contest import get_contest_problem_ids
 from judge.tasks import run_moss
 from judge.utils.celery import redirect_to_task_status
 from judge.utils.opengraph import generate_opengraph
 from judge.utils.problems import _get_result_data
+from judge.views.problem import SolvedProblemMixin
 from judge.utils.ranker import ranker
 from judge.utils.stats import get_bar_chart, get_pie_chart, get_histogram
+from judge.utils.diggpaginator import DiggPaginator
 from judge.utils.views import (
     DiggPaginatorMixin,
     QueryStringSortMixin,
     SingleObjectFormView,
     TitleMixin,
     generic_message,
+    paginate_query_context,
 )
 from judge.widgets import HeavyPreviewPageDownWidget
 from judge.views.pagevote import PageVoteDetailView
 from judge.views.bookmark import BookMarkDetailView
 
-
 __all__ = [
     "ContestList",
     "ContestDetail",
+    "ContestProblems",
     "ContestRanking",
     "ContestJoin",
     "ContestLeave",
@@ -103,11 +121,14 @@ __all__ = [
     "ContestMossDelete",
     "ContestParticipationList",
     "ContestParticipationDisqualify",
-    "get_contest_ranking_list",
-    "base_contest_ranking_list",
+    "get_ranking_queryset",
+    "get_contest_problems",
+    "build_ranking_profiles",
+    "compute_ranks",
     "ContestClarificationView",
-    "update_contest_mode",
     "OfficialContestList",
+    "RecommendedContestList",
+    "ContestProblemset",
 ]
 
 
@@ -178,6 +199,10 @@ class ContestList(
         if self.GET_with_session(request, "hide_organization_contests"):
             self.hide_organization_contests = 1
 
+        self.show_only_rated_contests = 0
+        if self.GET_with_session(request, "show_only_rated_contests"):
+            self.show_only_rated_contests = 1
+
         self.org_query = []
         if request.GET.get("orgs") and request.profile:
             try:
@@ -198,6 +223,7 @@ class ContestList(
         default_tab = "active"
         if not self.request.user.is_authenticated:
             default_tab = "current"
+
         self.current_tab = self.request.GET.get("tab", default_tab)
 
         self.setup_contest_list(request)
@@ -205,7 +231,7 @@ class ContestList(
         return super(ContestList, self).get(request, *args, **kwargs)
 
     def post(self, request, *args, **kwargs):
-        to_update = ("hide_organization_contests",)
+        to_update = ("hide_organization_contests", "show_only_rated_contests")
         for key in to_update:
             if key in request.GET:
                 val = request.GET.get(key) == "1"
@@ -221,7 +247,13 @@ class ContestList(
         queryset = (
             super(ContestList, self)
             .get_queryset()
-            .prefetch_related("tags", "organizations")
+            .prefetch_related(
+                "tags",
+                Prefetch(
+                    "course",
+                    queryset=CourseContest.objects.select_related("course"),
+                ),
+            )
         )
 
         if self.contest_query:
@@ -239,7 +271,9 @@ class ContestList(
         if not self.org_query and self.request.organization:
             self.org_query = [self.request.organization.id]
         if self.hide_organization_contests:
-            queryset = queryset.filter(organizations=None)
+            queryset = queryset.filter(organizations=None, is_in_course=False)
+        if self.show_only_rated_contests:
+            queryset = queryset.filter(is_rated=True)
         if self.org_query:
             queryset = queryset.filter(organizations__in=self.org_query)
         queryset = self.extra_queryset_filters(queryset)
@@ -251,6 +285,54 @@ class ContestList(
             .filter(end_time__lt=self._now)
             .order_by(self.order, "key")
         )
+
+    @cached_property
+    def _recommended_contests_queryset(self):
+        """Get recommended contests for the current user. Computed once per request."""
+        use_ml = getattr(settings, "USE_ML", False)
+        if use_ml:
+            from judge.utils.contest_recommendation import (
+                get_recommended_contests,
+                get_recommended_contests_for_anonymous,
+            )
+
+            if self.request.user.is_authenticated and self.request.profile:
+                scored = get_recommended_contests(self.request.profile, limit=100)
+                if scored:
+                    contest_ids = [cid for cid, _ in scored]
+                    preserved = Case(
+                        *[When(pk=pk, then=pos) for pos, pk in enumerate(contest_ids)]
+                    )
+                    return Contest.objects.filter(id__in=contest_ids).order_by(
+                        preserved
+                    )
+
+            contest_ids = get_recommended_contests_for_anonymous(limit=100)
+            if not contest_ids:
+                return Contest.objects.none()
+            return Contest.objects.filter(id__in=contest_ids).order_by("-user_count")
+
+        queryset = Contest.objects.filter(
+            is_visible=True,
+            is_private=False,
+            is_organization_private=False,
+            is_in_course=False,
+        )
+        if self.request.user.is_authenticated and self.request.profile:
+            participated_ids = ContestParticipation.objects.filter(
+                user=self.request.profile
+            ).values_list("contest_id", flat=True)
+            queryset = queryset.exclude(id__in=participated_ids)
+
+        contest_ids = list(queryset.values_list("id", flat=True))
+        if not contest_ids:
+            return Contest.objects.none()
+
+        rng = random.Random(timezone.localdate().isoformat())
+        rng.shuffle(contest_ids)
+        contest_ids = contest_ids[:100]
+        preserved = Case(*[When(pk=pk, then=pos) for pos, pk in enumerate(contest_ids)])
+        return Contest.objects.filter(id__in=contest_ids).order_by(preserved)
 
     def _active_participations(self):
         return ContestParticipation.objects.filter(
@@ -300,6 +382,20 @@ class ContestList(
         return participations
 
     def get_queryset(self):
+        # If no specific tab is requested and user is authenticated, check if we should default to current instead of active
+        if (
+            self.current_tab == "active"
+            and not self.request.GET.get("tab")
+            and self.request.user.is_authenticated
+        ):
+            active_participations = self._get_active_participations_queryset()
+            if len(active_participations) == 0:
+                # Switch to current tab since there are no active contests
+                self.current_tab = "current"
+                return self._get_current_contests_queryset()
+            else:
+                return active_participations
+
         if self.current_tab == "past":
             return self._get_past_contests_queryset()
         elif self.current_tab == "current":
@@ -317,14 +413,14 @@ class ContestList(
         context["current_count"] = self._get_current_contests_queryset().count()
         context["future_count"] = self._get_future_contests_queryset().count()
         context["active_count"] = len(self._get_active_participations_queryset())
-
         context["now"] = self._now
         context["first_page_href"] = "."
         context["contest_query"] = self.contest_query
         context["org_query"] = self.org_query
         context["hide_organization_contests"] = int(self.hide_organization_contests)
+        context["show_only_rated_contests"] = int(self.show_only_rated_contests)
         if self.request.profile:
-            context["organizations"] = self.request.profile.organizations.all()
+            context["organizations"] = self.request.profile.get_organizations()
         context["page_type"] = "list"
         context["selected_order"] = self.request.GET.get("order")
         context["all_sort_options"] = [
@@ -337,6 +433,9 @@ class ContestList(
         ]
         context.update(self.get_sort_context())
         context.update(self.get_sort_paginate_context())
+        Contest.prefetch_organization_ids(
+            *[contest.id for contest in context["contests"]]
+        )
         return context
 
 
@@ -381,11 +480,11 @@ class ContestMixin(object):
         context = super(ContestMixin, self).get_context_data(**kwargs)
         if self.request.user.is_authenticated:
             try:
-                context[
-                    "live_participation"
-                ] = self.request.profile.contest_history.get(
-                    contest=self.object,
-                    virtual=ContestParticipation.LIVE,
+                context["live_participation"] = (
+                    self.request.profile.contest_history.get(
+                        contest=self.object,
+                        virtual=ContestParticipation.LIVE,
+                    )
                 )
             except ContestParticipation.DoesNotExist:
                 context["live_participation"] = None
@@ -411,20 +510,20 @@ class ContestMixin(object):
         context["og_image"] = self.object.og_image or metadata[1]
         context["has_moss_api_key"] = settings.MOSS_API_KEY is not None
         context["contest_has_hidden_subtasks"] = self.object.format.has_hidden_subtasks
-        context[
-            "show_final_ranking"
-        ] = self.object.format.has_hidden_subtasks and self.object.is_editable_by(
-            self.request.user
-        )
+        has_hidden_results = self.object.contest_problems.filter(
+            is_result_hidden=True
+        ).exists()
+        context["show_final_ranking"] = (
+            self.object.format.has_hidden_subtasks or has_hidden_results
+        ) and self.object.is_editable_by(self.request.user)
         context["logo_override_image"] = self.object.logo_override_image
+        context["organizations"] = self.object.get_organizations()
+        context["is_clonable"] = is_contest_clonable(self.request, self.object)
 
-        if (
-            not context["logo_override_image"]
-            and self.object.organizations.count() == 1
-        ):
-            org_image = self.object.organizations.first().organization_image
+        if not context["logo_override_image"] and len(context["organizations"]) > 0:
+            org_image = context["organizations"][0].get_organization_image_url()
             if org_image:
-                context["logo_override_image"] = org_image.url
+                context["logo_override_image"] = org_image
 
         return context
 
@@ -490,7 +589,9 @@ class ContestMixin(object):
 class ContestDetail(
     ContestMixin,
     TitleMixin,
-    CommentedDetailView,
+    SolvedProblemMixin,
+    CommentableMixin,
+    DetailView,
     PageVoteDetailView,
     BookMarkDetailView,
 ):
@@ -499,61 +600,256 @@ class ContestDetail(
     def get_title(self):
         return self.object.name
 
+    @cached_property
+    def profile(self):
+        if not self.request.user.is_authenticated:
+            return None
+        return self.request.profile
+
+    @cached_property
+    def in_contest(self):
+        return self.request.in_contest
+
+    def _is_editable_organization(self, organization):
+        if self.request.profile.can_edit_organization(organization):
+            return True
+        if self.request.profile in organization and self.object.is_editable_by(
+            self.request.user
+        ):
+            return True
+        return False
+
     def get_editable_organizations(self):
         if not self.request.profile:
             return []
         res = []
-        for organization in self.object.organizations.all():
-            can_edit = False
-            if self.request.profile.can_edit_organization(organization):
-                can_edit = True
-            if self.request.profile in organization and self.object.is_editable_by(
-                self.request.user
-            ):
-                can_edit = True
-            if can_edit:
+        for organization in self.object.get_organizations():
+            if self._is_editable_organization(organization):
                 res.append(organization)
         return res
 
     def get_context_data(self, **kwargs):
         context = super(ContestDetail, self).get_context_data(**kwargs)
-        context["contest_problems"] = (
-            Problem.objects.filter(contests__contest=self.object)
-            .order_by("contests__order")
-            .defer("description")
-            .annotate(
-                has_public_editorial=Sum(
-                    Case(
-                        When(solution__is_public=True, then=1),
-                        default=0,
-                        output_field=IntegerField(),
-                    )
-                )
-            )
-            .add_i18n_name(self.request.LANGUAGE_CODE)
+        contest_problem_ids = get_contest_problem_ids(self.object.id)
+        Problem.prefetch_cache_i18n_name(
+            self.request.LANGUAGE_CODE, *contest_problem_ids
         )
+        context["contest_problems"] = Problem.get_cached_instances(*contest_problem_ids)
+        context["problems"] = context["contest_problems"]
         context["editable_organizations"] = self.get_editable_organizations()
-        context["is_clonable"] = is_contest_clonable(self.request, self.object)
+
+        # Get quizzes in this contest
+        contest_quizzes = (
+            ContestProblem.objects.filter(contest=self.object, quiz__isnull=False)
+            .select_related("quiz")
+            .order_by("order")
+        )
+        context["contest_quizzes"] = contest_quizzes
+        context["result_hidden_contest_quiz_ids"] = set(
+            cq.id for cq in contest_quizzes if cq.is_result_hidden
+        )
 
         if self.object.is_in_course:
-            from judge.models import Course, CourseContest
-
             course = CourseContest.get_course_of_contest(self.object)
-            if Course.is_editable_by(course, self.request.profile):
-                context["editable_course"] = course
+            context["course"] = course
+            context["is_editable_course"] = Course.is_editable_by(
+                course, self.request.profile
+            )
 
-        if self.request.in_contest:
-            context["current_contest"] = self.request.participation.contest
+        is_in_viewed_contest = (
+            self.request.in_contest
+            and self.request.participation.contest_id == self.object.id
+        )
+        context["current_contest"] = (
+            self.request.participation.contest if is_in_viewed_contest else None
+        )
+
+        # User's quiz attempt data for display
+        if self.profile and is_in_viewed_contest:
+            from judge.models.quiz import QuizAttempt
+
+            quiz_user_data = {}
+            for cq in context["contest_quizzes"]:
+                attempts = QuizAttempt.objects.filter(
+                    quiz=cq.quiz,
+                    user=self.profile,
+                    contest_participation=self.request.participation,
+                    is_submitted=True,
+                )
+                best = attempts.order_by("-score").first()
+                contest_score = None
+                if best and best.score is not None and best.max_score:
+                    contest_score = (
+                        float(best.score) / float(best.max_score) * cq.points
+                    )
+                quiz_user_data[cq.quiz.id] = {
+                    "best_score": contest_score,
+                    "best_attempt_id": best.id if best else None,
+                    "attempt_count": attempts.count(),
+                }
+            context["quiz_user_data"] = quiz_user_data
+
+        context["has_hidden_subtasks"] = self.object.format.has_hidden_subtasks
+        context["hide_contest_scoreboard"] = self.object.scoreboard_visibility in (
+            self.object.SCOREBOARD_AFTER_CONTEST,
+            self.object.SCOREBOARD_AFTER_PARTICIPATION,
+        )
+
+        # Per-problem result hiding
+        if not self.object.is_editable_by(self.request.user):
+            context["result_hidden_problem_ids"] = set(
+                self.object.contest_problems.filter(
+                    is_result_hidden=True, problem__isnull=False
+                ).values_list("problem_id", flat=True)
+            )
         else:
-            context["current_contest"] = None
+            context["result_hidden_problem_ids"] = set()
+
+        if self.profile:
+            if is_in_viewed_contest:
+                context["completed_problem_ids"] = self.get_completed_problems()
+                context["attempted_problems"] = self.get_attempted_problems()
+            else:
+                from judge.utils.problems import user_attempted_ids, user_completed_ids
+
+                context["completed_problem_ids"] = user_completed_ids(self.profile)
+                context["attempted_problems"] = user_attempted_ids(self.profile)
+
+        # Clarifications
+        if self.object.use_clarifications:
+            context["clarifications"] = (
+                ContestProblemClarification.objects.filter(problem__contest=self.object)
+                .select_related("problem__problem")
+                .order_by("-date")
+            )
+
+        context = self.get_comment_context(context)
+
+        return context
+
+
+class ContestProblems(ContestMixin, SolvedProblemMixin, TitleMixin, DetailView):
+    template_name = "contest/problems.html"
+
+    def get_title(self):
+        return _("Problems in %s") % self.object.name
+
+    @cached_property
+    def profile(self):
+        if not self.request.user.is_authenticated:
+            return None
+        return self.request.profile
+
+    def get_context_data(self, **kwargs):
+        if not self.object.can_see_problems(self.request.user):
+            raise Http404()
+        context = super().get_context_data(**kwargs)
+        contest = self.object
+        contest_problem_ids = get_contest_problem_ids(contest.id)
+        Problem.prefetch_cache_i18n_name(
+            self.request.LANGUAGE_CODE, *contest_problem_ids
+        )
+        context["contest_problems"] = Problem.get_cached_instances(*contest_problem_ids)
+        context["problems"] = context["contest_problems"]
+
+        # Quizzes
+        contest_quizzes = (
+            ContestProblem.objects.filter(contest=contest, quiz__isnull=False)
+            .select_related("quiz")
+            .order_by("order")
+        )
+        context["contest_quizzes"] = contest_quizzes
+        context["result_hidden_contest_quiz_ids"] = set(
+            cq.id for cq in contest_quizzes if cq.is_result_hidden
+        )
+
+        # User's quiz attempt data for display
+        is_in_contest = contest.is_in_contest(self.request.user)
+        if self.profile and is_in_contest and self.request.in_contest:
+            from judge.models.quiz import QuizAttempt
+
+            quiz_user_data = {}
+            for cq in contest_quizzes:
+                attempts = QuizAttempt.objects.filter(
+                    quiz=cq.quiz,
+                    user=self.profile,
+                    contest_participation=self.request.participation,
+                    is_submitted=True,
+                )
+                best = attempts.order_by("-score").first()
+                contest_score = None
+                if best and best.score is not None and best.max_score:
+                    contest_score = (
+                        float(best.score) / float(best.max_score) * cq.points
+                    )
+                quiz_user_data[cq.quiz.id] = {
+                    "best_score": contest_score,
+                    "best_attempt_id": best.id if best else None,
+                    "attempt_count": attempts.count(),
+                }
+            context["quiz_user_data"] = quiz_user_data
+
+        # Determine if user is actively in this contest (live or virtual)
+        context["is_in_contest"] = is_in_contest
+        context["current_contest"] = (
+            self.request.participation.contest
+            if (
+                self.request.in_contest
+                and self.request.participation.contest_id == contest.id
+            )
+            else None
+        )
+
+        context["has_hidden_subtasks"] = contest.format.has_hidden_subtasks
+        context["hide_contest_scoreboard"] = contest.scoreboard_visibility in (
+            contest.SCOREBOARD_AFTER_CONTEST,
+            contest.SCOREBOARD_AFTER_PARTICIPATION,
+        )
+
+        # Per-problem result hiding
+        if not contest.is_editable_by(self.request.user):
+            context["result_hidden_problem_ids"] = set(
+                contest.contest_problems.filter(
+                    is_result_hidden=True, problem__isnull=False
+                ).values_list("problem_id", flat=True)
+            )
+        else:
+            context["result_hidden_problem_ids"] = set()
+
+        if self.profile:
+            if is_in_contest:
+                context["completed_problem_ids"] = self.get_completed_problems()
+                context["attempted_problems"] = self.get_attempted_problems()
+            else:
+                from judge.utils.problems import user_attempted_ids, user_completed_ids
+
+                context["completed_problem_ids"] = user_completed_ids(self.profile)
+                context["attempted_problems"] = user_attempted_ids(self.profile)
+
+        # Clarifications
+        if contest.use_clarifications:
+            context["clarifications"] = (
+                ContestProblemClarification.objects.filter(problem__contest=contest)
+                .select_related("problem__problem")
+                .order_by("-date")
+            )
+
         return context
 
 
 def is_contest_clonable(request, contest):
     if not request.profile:
         return False
-    if not Organization.objects.filter(admins=request.profile).exists():
+
+    if (
+        not request.profile.get_admin_organization_ids()
+        and not Course.objects.filter(
+            courserole__user=request.profile,
+            courserole__role__in=EDITABLE_ROLES,
+        ).exists()
+    ):
         return False
+
     if request.user.has_perm("judge.clone_contest"):
         return True
     if contest.access_code and not contest.is_editable_by(request.user):
@@ -584,12 +880,17 @@ class ContestClone(ContestMixin, TitleMixin, SingleObjectFormView):
                 "id", "name"
             )
         )
+        kwargs["course_choices"] = tuple(
+            Course.objects.filter(
+                courserole__user=self.request.profile,
+                courserole__role__in=EDITABLE_ROLES,
+            ).values_list("id", "name")
+        )
         kwargs["profile"] = self.request.profile
         return kwargs
 
     def form_valid(self, form):
         tags = self.object.tags.all()
-        organization = form.cleaned_data["organization"]
         private_contestants = self.object.private_contestants.all()
         view_contest_scoreboard = self.object.view_contest_scoreboard.all()
         contest_problems = self.object.contest_problems.all()
@@ -604,26 +905,40 @@ class ContestClone(ContestMixin, TitleMixin, SingleObjectFormView):
         contest.save()
 
         contest.tags.set(tags)
-        contest.organizations.set([organization])
         contest.private_contestants.set(private_contestants)
         contest.view_contest_scoreboard.set(view_contest_scoreboard)
         contest.authors.add(self.request.profile)
+
+        target_type = form.cleaned_data["target_type"]
+        if target_type == "organization":
+            contest.is_in_course = False
+            organization = form.cleaned_data["organization"]
+            contest.organizations.set([organization])
+        elif target_type == "course":
+            course = form.cleaned_data["course"]
+            contest.is_in_course = True
+            contest.organizations.clear()
+
+            # Create a CourseContest entry that links the cloned contest to the course
+            CourseContest.objects.create(
+                course=course,
+                contest=contest,
+                order=CourseContest.objects.filter(course=course).count() + 1,
+                points=0,  # Default points, can be adjusted as needed
+            )
+        else:
+            raise Http404("Invalid target type selected.")
+
+        redirect_url = reverse("contest_edit", args=(contest.key,))
 
         for problem in contest_problems:
             problem.contest = contest
             problem.pk = None
         ContestProblem.objects.bulk_create(contest_problems)
 
-        return HttpResponseRedirect(
-            reverse(
-                "organization_contest_edit",
-                args=(
-                    organization.id,
-                    organization.slug,
-                    contest.key,
-                ),
-            )
-        )
+        contest.save()
+
+        return HttpResponseRedirect(redirect_url)
 
 
 class ContestAccessDenied(Exception):
@@ -744,8 +1059,7 @@ class ContestJoin(LoginRequiredMixin, ContestMixin, BaseDetailView):
         profile.save()
         contest._updating_stats_only = True
         contest.update_user_count()
-        request.session["contest_mode"] = True
-        return HttpResponseRedirect(reverse("problem_list"))
+        return HttpResponseRedirect(reverse("contest_problems", args=(contest.key,)))
 
     def ask_for_access_code(self, form=None):
         contest = self.object
@@ -787,7 +1101,6 @@ class ContestLeave(LoginRequiredMixin, ContestMixin, BaseDetailView):
             )
 
         profile.remove_contest()
-        request.session["contest_mode"] = True  # reset contest_mode
         return HttpResponseRedirect(reverse("contest_view", args=(contest.key,)))
 
 
@@ -1038,135 +1351,131 @@ class ContestStats(TitleMixin, ContestMixin, DetailView):
 
 ContestRankingProfile = namedtuple(
     "ContestRankingProfile",
-    "id user username points cumtime tiebreaker participation "
+    "id user points cumtime tiebreaker participation "
     "participation_rating problem_cells result_cell",
 )
 
 BestSolutionData = namedtuple("BestSolutionData", "code points time state is_pretested")
 
 
-def make_contest_ranking_profile(
-    contest, participation, contest_problems, show_final=False
-):
-    if not show_final:
-        points = participation.score
-        cumtime = participation.cumtime
-    else:
-        points = participation.score_final
-        cumtime = participation.cumtime_final
-
-    user = participation.user
-    return ContestRankingProfile(
-        id=user.id,
-        user=user,
-        username=user.username,
-        points=points,
-        cumtime=cumtime,
-        tiebreaker=participation.tiebreaker,
-        participation_rating=participation.rating.rating
-        if hasattr(participation, "rating")
-        else None,
-        problem_cells=[
-            contest.format.display_user_problem(
-                participation, contest_problem, show_final
-            )
-            for contest_problem in contest_problems
-        ],
-        result_cell=contest.format.display_participation_result(
-            participation, show_final
-        ),
-        participation=participation,
-    )
-
-
-def base_contest_ranking_list(
-    contest, problems, queryset, show_final=False, extra_participation=None
-):
-    participation_fields = [
-        field.name
-        for field in ContestParticipation._meta.get_fields()
-        if field.concrete and not field.many_to_many
-    ]
-    fields_to_fetch = participation_fields + [
-        "user__id",
-        "rating__rating",
-    ]
-
-    res = [
-        make_contest_ranking_profile(contest, participation, problems, show_final)
-        for participation in queryset.select_related("user", "rating").only(
-            *fields_to_fetch
+def get_ranking_queryset(contest, queryset=None, show_final=False):
+    """Return an ordered ContestParticipation queryset."""
+    if queryset is None:
+        queryset = contest.users.filter(virtual=0)
+    if show_final:
+        return queryset.order_by(
+            "is_disqualified", "-score_final", "cumtime_final", "tiebreaker", "id"
         )
-    ]
-    Profile.prefetch_profile_cache([p.id for p in res])
+    return queryset.order_by("is_disqualified", "-score", "cumtime", "tiebreaker", "id")
+
+
+def get_contest_problems(contest):
+    """Fetch contest problems. Problem data accessed via cache (no JOIN)."""
+    problems = list(contest.contest_problems.select_related("quiz").order_by("order"))
+    # Pre-populate Django's FK cache from CacheableModel cache,
+    # so contest_problem.problem.code hits cache instead of DB
+    problem_ids = [cp.problem_id for cp in problems if cp.problem_id]
+    if problem_ids:
+        cached = {p.id: p for p in Problem.get_cached_instances(*problem_ids)}
+        for cp in problems:
+            if cp.problem_id in cached:
+                cp.problem = cached[cp.problem_id]
+    return problems
+
+
+def build_ranking_profiles(contest, problems, participations, show_final=False):
+    """Convert participations into ContestRankingProfile list with rendered cells."""
+    if not hasattr(contest, "_result_hidden_ids"):
+        contest._result_hidden_ids = set(
+            contest.contest_problems.filter(is_result_hidden=True).values_list(
+                "id", flat=True
+            )
+        )
+    result_hidden_ids = contest._result_hidden_ids if not show_final else set()
+
+    # Ensure full objects are loaded with relations
+    if hasattr(participations, "select_related"):
+        participations = participations.select_related("user", "rating")
+
+    res = []
+    for participation in participations:
+        points = participation.score_final if show_final else participation.score
+        cumtime = participation.cumtime_final if show_final else participation.cumtime
+
+        format_data = participation.format_data or {}
+        problem_cells = []
+        for cp in problems:
+            if result_hidden_ids and cp.id in result_hidden_ids:
+                key = f"quiz_{cp.id}" if cp.quiz_id else str(cp.id)
+                if key in format_data:
+                    cell = format_html(
+                        '<td class="problem-score-col"><span>?</span></td>'
+                    )
+                else:
+                    cell = contest.format.display_empty_cell(cp)
+            else:
+                cell = contest.format.display_user_problem(
+                    participation, cp, show_final
+                )
+            problem_cells.append(cell)
+
+        res.append(
+            ContestRankingProfile(
+                id=participation.user_id,
+                user=participation.user,
+                points=points,
+                cumtime=cumtime,
+                tiebreaker=participation.tiebreaker,
+                participation_rating=(
+                    participation.rating.rating
+                    if hasattr(participation, "rating")
+                    else None
+                ),
+                problem_cells=problem_cells,
+                result_cell=contest.format.display_participation_result(
+                    participation, show_final
+                ),
+                participation=participation,
+            )
+        )
+
+    Profile.get_cached_instances(*[p.id for p in res])
     return res
 
 
-def contest_ranking_list(
-    contest, problems, queryset=None, show_final=False, extra_participation=None
-):
-    if queryset is None:
-        queryset = contest.users.filter(virtual=0)
+def compute_ranks(rows, target_ids=None, include_position=False):
+    """Compute ranks from ordered rows using ranker() tie logic.
 
-    if extra_participation and extra_participation.virtual:
-        queryset = queryset | contest.users.filter(id=extra_participation.id)
+    Args:
+        rows: iterable of (id, score, cumtime, tiebreaker) tuples (already ordered)
+        target_ids: if set, only return results for these IDs (and stop early if all found)
+        include_position: if True, return {id: (rank, position)} instead of {id: rank}
 
-    if show_final:
-        queryset = queryset.order_by(
-            "is_disqualified", "-score_final", "cumtime_final", "tiebreaker"
-        )
-    else:
-        queryset = queryset.order_by(
-            "is_disqualified", "-score", "cumtime", "tiebreaker"
-        )
+    Returns:
+        dict {id: rank} or {id: (rank, position)}
+    """
+    result = {}
+    rank = 0
+    delta = 1
+    last_key = None
+    remaining = set(target_ids) if target_ids else None
 
-    return base_contest_ranking_list(
-        contest,
-        problems,
-        queryset,
-        show_final,
-    )
+    for i, (pid, score, cumtime, tb) in enumerate(rows):
+        key = (score, cumtime, tb)
+        if key != last_key:
+            rank += delta
+            delta = 0
+        delta += 1
+        last_key = key
 
+        if remaining is None or pid in remaining:
+            result[pid] = (rank, i) if include_position else rank
+            if remaining:
+                remaining.discard(pid)
+                if not remaining:
+                    break
 
-def get_contest_ranking_list(
-    request,
-    contest,
-    participation=None,
-    ranking_list=contest_ranking_list,
-    ranker=ranker,
-    show_final=False,
-):
-    problems = list(
-        contest.contest_problems.select_related("problem")
-        .defer("problem__description")
-        .order_by("order")
-    )
-
-    if participation is None:
-        participation = _get_current_virtual_participation(request, contest)
-
-    ranking_list_result = ranking_list(
-        contest, problems, show_final=show_final, extra_participation=participation
-    )
-
-    users = ranker(
-        ranking_list_result,
-        key=attrgetter("points", "cumtime", "tiebreaker"),
-    )
-    return users, problems
-
-
-def _get_current_virtual_participation(request, contest):
-    # Return None if not eligible
-    if not request.user.is_authenticated:
-        return None
-
-    participation = request.profile.current_contest
-
-    if participation is None or participation.contest_id != contest.id:
-        return None
-
-    return participation
+    return result
 
 
 class ContestRankingBase(ContestMixin, TitleMixin, DetailView):
@@ -1192,7 +1501,16 @@ class ContestRankingBase(ContestMixin, TitleMixin, DetailView):
         context["users"] = users
         context["problems"] = problems
         context["page_type"] = self.page_type
+        has_hidden_results = self.object.contest_problems.filter(
+            is_result_hidden=True
+        ).exists()
+        context["show_final_ranking"] = (
+            self.object.format.has_hidden_subtasks or has_hidden_results
+        ) and self.object.is_editable_by(self.request.user)
         return context
+
+
+RANKING_PAGE_SIZE = 100
 
 
 class ContestRanking(ContestRankingBase):
@@ -1205,33 +1523,176 @@ class ContestRanking(ContestRankingBase):
     def get_title(self):
         return _("%s Rankings") % self.object.name
 
-    def get_ranking_list(self):
-        if not self.object.can_see_full_scoreboard(self.request.user):
-            queryset = self.object.users.filter(
-                user=self.request.profile, virtual=ContestParticipation.LIVE
-            )
-            return get_contest_ranking_list(
-                self.request,
-                self.object,
-                ranking_list=partial(base_contest_ranking_list, queryset=queryset),
-                ranker=lambda users, key: ((_("???"), user) for user in users),
-            )
+    def get(self, request, *args, **kwargs):
+        if request.GET.get("format") == "csv":
+            self.object = self.get_object()
+            self.setup_filters()
+            return self._render_csv()
+        return super().get(request, *args, **kwargs)
 
+    def _render_csv(self):
+        contest = self.object
+        if not contest.can_see_full_scoreboard(self.request.user):
+            raise Http404()
+
+        problems = get_contest_problems(contest)
+        self.all_rows = self._get_lightweight_rows(self._get_base_queryset())
+        filtered_rows = self._filter_rows(self.all_rows)
+        filtered_ids = [r[0] for r in filtered_rows]
+        qs = get_ranking_queryset(
+            contest, contest.users.filter(id__in=filtered_ids), self.show_final
+        )
+        s = "score_final" if self.show_final else "score"
+
+        # Fetch only what CSV needs: username, names, score, format_data
+        participations = qs.select_related("user__user").only(
+            "id",
+            "user__user__username",
+            "user__user__first_name",
+            "user__user__last_name",
+            s,
+            "cumtime",
+            "tiebreaker",
+            "format_data",
+        )
+
+        # Compute ranks from lightweight rows
+        rows = ((pid, s_, c_, tb) for pid, _uid, s_, c_, tb in filtered_rows)
+        rank_map = compute_ranks(rows)
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        header = [_("Rank"), _("Username"), _("Full Name"), _("School"), _("Score")]
+        for cp in problems:
+            header.append(contest.get_label_for_problem(cp.order))
+        writer.writerow(header)
+
+        for p in participations:
+            fd = p.format_data or {}
+            row = [
+                rank_map.get(p.id, ""),
+                p.user.user.username,
+                p.user.user.first_name or "",
+                p.user.user.last_name or "",
+                getattr(p, s),
+            ]
+            for cp in problems:
+                k = f"quiz_{cp.id}" if cp.quiz_id else str(cp.id)
+                pdata = fd.get(k)
+                row.append(pdata["points"] if pdata else "")
+            writer.writerow(row)
+
+        response = HttpResponse(output.getvalue(), content_type="text/csv")
+        safe_key = contest.key.replace('"', "").replace(";", "")
+        response["Content-Disposition"] = (
+            f'attachment; filename="{safe_key}_ranking.csv"'
+        )
+        return response
+
+    def _get_base_queryset(self):
+        """Base queryset with virtual filter + search (DB-level)."""
         queryset = self.object.users
-        if self.friend_only:
-            friends = self.request.profile.get_friends()
-            queryset = queryset.filter(user_id__in=friends)
         if not self.include_virtual:
             queryset = queryset.filter(virtual=0)
         else:
             queryset = queryset.filter(virtual__gte=0)
+        if self.search_query:
+            queryset = queryset.filter(
+                Q(user__user__username__icontains=self.search_query)
+                | Q(user__user__first_name__icontains=self.search_query)
+            )
+        return queryset
 
-        return get_contest_ranking_list(
-            self.request,
-            self.object,
-            ranking_list=partial(contest_ranking_list, queryset=queryset),
-            show_final=self.show_final,
+    def _get_lightweight_rows(self, queryset):
+        """Fetch ordered (id, user_id, score, cumtime, tiebreaker) tuples."""
+        s = "score_final" if self.show_final else "score"
+        c = "cumtime_final" if self.show_final else "cumtime"
+        qs = get_ranking_queryset(self.object, queryset, self.show_final)
+        return list(qs.values_list("id", "user_id", s, c, "tiebreaker"))
+
+    def _filter_rows(self, rows):
+        """Apply friend/favorites filters in Python."""
+        if self.friend_only:
+            followings = set(self.request.profile.get_following_ids(True))
+            rows = [r for r in rows if r[1] in followings]
+        if self.favorite_ids:
+            fav_set = set(self.favorite_ids)
+            rows = [r for r in rows if r[1] in fav_set]
+        return rows
+
+    def get_ranking_list(self):
+        contest = self.object
+
+        if not contest.can_see_full_scoreboard(self.request.user):
+            qs = get_ranking_queryset(
+                contest,
+                contest.users.filter(
+                    user=self.request.profile, virtual=ContestParticipation.LIVE
+                ),
+                self.show_final,
+            )
+            problems = get_contest_problems(contest)
+            profiles = build_ranking_profiles(contest, problems, qs, self.show_final)
+            users = ((_("???"), user) for user in profiles)
+            return users, problems
+
+        problems = get_contest_problems(contest)
+
+        # One lightweight query for all participants (with search at DB level)
+        self.all_rows = self._get_lightweight_rows(self._get_base_queryset())
+        filtered_rows = self._filter_rows(self.all_rows)
+
+        # Paginate in Python
+        total = len(filtered_rows)
+        page_number = 1
+
+        # ?user=username → find their page
+        highlight_user = self.request.GET.get("user", "").strip()
+        if highlight_user:
+            target_uid = (
+                Profile.objects.filter(user__username=highlight_user)
+                .values_list("id", flat=True)
+                .first()
+            )
+            if target_uid:
+                for i, (pid, uid, *_rest) in enumerate(filtered_rows):
+                    if uid == target_uid:
+                        page_number = (i // RANKING_PAGE_SIZE) + 1
+                        self.highlight_username = highlight_user
+                        break
+
+        if not highlight_user:
+            try:
+                page_number = int(self.request.GET.get("page", 1))
+            except ValueError:
+                page_number = 1
+        num_pages = max(1, (total + RANKING_PAGE_SIZE - 1) // RANKING_PAGE_SIZE)
+        page_number = max(1, min(page_number, num_pages))
+
+        start = (page_number - 1) * RANKING_PAGE_SIZE
+        page_rows = filtered_rows[start : start + RANKING_PAGE_SIZE]
+
+        # Fetch full objects for this page only
+        page_ids = [row[0] for row in page_rows]
+        qs = get_ranking_queryset(
+            contest, contest.users.filter(id__in=page_ids), self.show_final
         )
+        profiles = build_ranking_profiles(contest, problems, qs, self.show_final)
+
+        rank_map = compute_ranks(
+            ((pid, s, c, tb) for pid, _uid, s, c, tb in filtered_rows),
+            target_ids=set(page_ids),
+        )
+        users = ((rank_map[p.participation.id], p) for p in profiles)
+
+        # Build page_obj for template pagination
+        self.page_obj = DiggPaginator(
+            filtered_rows, RANKING_PAGE_SIZE, body=3, tail=1, padding=1
+        ).get_page(page_number)
+        self.filtered_rows = filtered_rows
+
+        return users, problems
 
     def _get_default_include_virtual(self):
         if hasattr(self.object, "official"):
@@ -1246,18 +1707,91 @@ class ContestRanking(ContestRankingBase):
         self.include_virtual = bool(
             self.request.GET.get("virtual", self._get_default_include_virtual()) == "1"
         )
+        self.search_query = self.request.GET.get("search", "").strip()
         self.ajax_only = bool(self.request.GET.get("ajax") == "1")
+        self.page_obj = None
+        self.all_rows = None
+        self.filtered_rows = None
+        self.highlight_username = None
+
+        # Parse favorite user IDs (max 50, from localStorage via JS)
+        self.favorite_ids = []
+        fav_param = self.request.GET.get("favorites", "")
+        if fav_param:
+            for x in fav_param.split(",")[:50]:
+                try:
+                    self.favorite_ids.append(int(x))
+                except ValueError:
+                    pass
 
         if self.ajax_only:
-            self.template_name = "contest/ranking-table.html"
+            self.template_name = "contest/ranking-ajax.html"
+
+    def _find_my_position(self):
+        """Find current user's position and rank in filtered_rows (no extra queries)."""
+        if not self.request.user.is_authenticated or not self.filtered_rows:
+            return None
+        my_pid = (
+            self.object.users.filter(
+                user=self.request.profile, virtual=ContestParticipation.LIVE
+            )
+            .values_list("id", flat=True)
+            .first()
+        )
+        if not my_pid:
+            return None
+
+        rows = ((pid, s, c, tb) for pid, uid, s, c, tb in self.filtered_rows)
+        ranks = compute_ranks(rows, target_ids={my_pid}, include_position=True)
+        if my_pid not in ranks:
+            return None
+        rank, position = ranks[my_pid]
+        return {
+            "rank": rank,
+            "page": (position // RANKING_PAGE_SIZE) + 1,
+            "participation_id": my_pid,
+        }
+
+    def _compute_global_ranks(self, page_user_ids):
+        """Compute overall ranks from all_rows (no extra queries)."""
+        rows = ((uid, s, c, tb) for _pid, uid, s, c, tb in self.all_rows)
+        return compute_ranks(rows, target_ids=page_user_ids)
 
     def get_context_data(self, **kwargs):
         self.setup_filters()
         context = super().get_context_data(**kwargs)
         context["has_rating"] = self.object.ratings.exists()
+        context["search_query"] = self.search_query
+        context["page_obj"] = self.page_obj
+        if self.page_obj is not None:
+            context.update(paginate_query_context(self.request))
+            my_info = self._find_my_position()
+            if my_info:
+                context["my_page"] = my_info["page"]
+                context["my_rank"] = my_info["rank"]
+                if my_info["page"] != self.page_obj.number:
+                    participation = (
+                        self.object.users.filter(id=my_info["participation_id"])
+                        .select_related("user", "rating")
+                        .first()
+                    )
+                    if participation:
+                        context["my_profile"] = build_ranking_profiles(
+                            self.object,
+                            context["problems"],
+                            [participation],
+                            self.show_final,
+                        )[0]
+            if self.friend_only or self.favorite_ids:
+                start = (self.page_obj.number - 1) * RANKING_PAGE_SIZE
+                end = self.page_obj.number * RANKING_PAGE_SIZE
+                page_user_ids = set(row[1] for row in self.filtered_rows[start:end])
+                context["global_ranks"] = self._compute_global_ranks(page_user_ids)
+        context["highlight_username"] = self.highlight_username
         if not self.ajax_only:
             context["include_virtual"] = self.include_virtual
             context["friend_only"] = self.friend_only
+            context["last_msg"] = event.last()
         return context
 
 
@@ -1268,7 +1802,11 @@ class ContestFinalRanking(LoginRequiredMixin, ContestRanking):
     def get_ranking_list(self):
         if not self.object.is_editable_by(self.request.user):
             raise Http404()
-        if not self.object.format.has_hidden_subtasks:
+        has_hidden = (
+            self.object.format.has_hidden_subtasks
+            or self.object.contest_problems.filter(is_result_hidden=True).exists()
+        )
+        if not has_hidden:
             raise Http404()
         return super().get_ranking_list()
 
@@ -1279,7 +1817,10 @@ class ContestParticipationList(LoginRequiredMixin, ContestRankingBase):
     def get_title(self):
         if self.profile == self.request.profile:
             return _("Your participation in %s") % self.object.name
-        return _("%s's participation in %s") % (self.profile.username, self.object.name)
+        return _("%(username)s's participation in %(contest)s") % {
+            "username": self.profile.username,
+            "contest": self.object.name,
+        }
 
     def get_ranking_list(self):
         if (
@@ -1288,24 +1829,22 @@ class ContestParticipationList(LoginRequiredMixin, ContestRankingBase):
         ):
             raise Http404()
 
-        queryset = self.object.users.filter(user=self.profile, virtual__gte=0).order_by(
+        contest = self.object
+        qs = contest.users.filter(user=self.profile, virtual__gte=0).order_by(
             "-virtual"
         )
+
+        problems = get_contest_problems(contest)
+        profiles = build_ranking_profiles(contest, problems, qs)
+
         live_link = format_html(
             '<a href="{2}#!{1}">{0}</a>',
             _("Live"),
             self.profile.username,
-            reverse("contest_ranking", args=[self.object.key]),
+            reverse("contest_ranking", args=[contest.key]),
         )
-
-        return get_contest_ranking_list(
-            self.request,
-            self.object,
-            ranking_list=partial(base_contest_ranking_list, queryset=queryset),
-            ranker=lambda users, key: (
-                (user.participation.virtual or live_link, user) for user in users
-            ),
-        )
+        users = ((user.participation.virtual or live_link, user) for user in profiles)
+        return users, problems
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -1339,6 +1878,36 @@ class ContestParticipationDisqualify(ContestMixin, SingleObjectMixin, View):
             pass
         else:
             participation.set_disqualified(not participation.is_disqualified)
+        return HttpResponseRedirect(reverse("contest_ranking", args=(self.object.key,)))
+
+
+class ContestBulkDisqualify(ContestMixin, SingleObjectMixin, View):
+    def get_object(self, queryset=None):
+        contest = super().get_object(queryset)
+        if not contest.is_editable_by(self.request.user):
+            raise Http404()
+        return contest
+
+    def post(self, request, *args, **kwargs):
+        self.object = self.get_object()
+
+        usernames_raw = request.POST.get("usernames", "")
+        # Split by comma, space, or newline and remove empty strings
+        usernames = set()
+        for part in usernames_raw.replace(",", " ").replace("\n", " ").split():
+            username = part.strip()
+            if username:
+                usernames.add(username)
+
+        disqualified_count = 0
+        for username in usernames:
+            # Use filter() instead of get() because a user can have multiple participations
+            participations = self.object.users.filter(user__user__username=username)
+            for participation in participations:
+                if not participation.is_disqualified:
+                    participation.set_disqualified(True)
+                    disqualified_count += 1
+
         return HttpResponseRedirect(reverse("contest_ranking", args=(self.object.key,)))
 
 
@@ -1470,7 +2039,9 @@ class NewContestClarificationView(ContestMixin, TitleMixin, SingleObjectFormView
         )
         clarification.save()
 
-        return HttpResponseRedirect(reverse("problem_list"))
+        return HttpResponseRedirect(
+            reverse("contest_view", args=(self.get_object().key,))
+        )
 
     def get_title(self):
         return "New clarification for %s" % self.object.name
@@ -1525,18 +2096,9 @@ class ContestClarificationAjax(ContestMixin, DetailView):
         return JsonResponse(res, safe=False, json_dumps_params={"ensure_ascii": False})
 
 
-def update_contest_mode(request):
-    if not request.is_ajax() or not request.method == "POST":
-        return HttpResponseNotAllowed(["POST"])
-
-    old_mode = request.session.get("contest_mode", True)
-    request.session["contest_mode"] = not old_mode
-    return HttpResponse()
-
-
 ContestsSummaryData = namedtuple(
     "ContestsSummaryData",
-    "username first_name last_name points point_contests css_class",
+    "user_id points point_contests",
 )
 
 
@@ -1560,6 +2122,17 @@ class ContestsSummaryView(DiggPaginatorMixin, ListView):
         context["contests"] = self.contests_summary.contests.all()
         context["title"] = _("Contests")
         context["first_page_href"] = "."
+
+        # Prefetch all user profiles using cached instances
+        user_ids = [item[1]["user_id"] for item in context["object_list"]]
+        profiles = {}
+        if user_ids:
+            # Get cached profile instances and create a lookup dictionary
+            profiles = {p.id: p for p in Profile.get_cached_instances(*user_ids)}
+
+        # Add profile lookup to context
+        context["profiles"] = profiles
+
         return context
 
 
@@ -1568,27 +2141,45 @@ def recalculate_contest_summary_result(request, contest_summary):
     contests = contest_summary.contests.all()
     total_points = defaultdict(int)
     result_per_contest = defaultdict(lambda: [(0, 0)] * len(contests))
-    user_css_class = {}
 
     for i in range(len(contests)):
         contest = contests[i]
-        users, problems = get_contest_ranking_list(request, contest)
+        problems = get_contest_problems(contest)
+        qs = get_ranking_queryset(contest)
+        profiles = build_ranking_profiles(contest, problems, qs)
+        users = list(
+            ranker(profiles, key=attrgetter("points", "cumtime", "tiebreaker"))
+        )
+
+        # Group users by rank and calculate sum of points for tied positions
+        rank_groups = defaultdict(list)
         for rank, user in users:
-            curr_score = 0
-            if rank - 1 < len(scores_system):
-                curr_score = scores_system[rank - 1]
+            rank_groups[rank].append(user)
+
+        # Calculate points for each rank group
+        rank_points = {}
+        for rank, group_users in rank_groups.items():
+            num_users = len(group_users)
+            # Sum the points for all positions occupied by tied users
+            total_rank_points = 0
+            for j in range(num_users):
+                position_index = rank - 1 + j
+                if position_index < len(scores_system):
+                    total_rank_points += scores_system[position_index]
+            # Divide the sum equally among all tied users
+            rank_points[rank] = total_rank_points / num_users if num_users > 0 else 0
+
+        # Assign calculated points to each user
+        for rank, user in users:
+            curr_score = rank_points[rank]
             total_points[user.user] += curr_score
             result_per_contest[user.user][i] = (curr_score, rank)
-            user_css_class[user.user] = user.user.css_class
 
     sorted_total_points = [
         ContestsSummaryData(
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name,
+            user_id=user.id,
             points=total_points[user],
             point_contests=result_per_contest[user],
-            css_class=user_css_class[user],
         )
         for user in total_points
     ]
@@ -1606,6 +2197,7 @@ class OfficialContestList(ContestList):
         self.contest_query = request.GET.get("contest", "")
         self.org_query = []
         self.hide_organization_contests = False
+        self.show_only_rated_contests = False
 
         self.selected_categories = []
         self.selected_locations = []
@@ -1660,3 +2252,281 @@ class OfficialContestList(ContestList):
         context["year_to"] = self.year_to
 
         return context
+
+
+class RecommendedContestList(ContestList):
+    title = gettext_lazy("For you")
+    template_name = "contest/recommended_list.html"
+
+    def setup_contest_list(self, request):
+        self.contest_query = request.GET.get("contest", "")
+        self.org_query = []
+        self.hide_organization_contests = False
+
+        self.show_only_rated_contests = 0
+        if self.GET_with_session(request, "show_only_rated_contests"):
+            self.show_only_rated_contests = 1
+
+    def get(self, request, *args, **kwargs):
+        self.current_tab = "recommended"
+        self.setup_contest_list(request)
+        return super(ContestList, self).get(request, *args, **kwargs)
+
+    def post(self, request, *args, **kwargs):
+        key = "show_only_rated_contests"
+        if key in request.GET:
+            request.session[key] = request.GET.get(key) == "1"
+        else:
+            request.session[key] = False
+        return HttpResponseRedirect(request.get_full_path())
+
+    def get_queryset(self):
+        queryset = self._recommended_contests_queryset
+        if self.contest_query:
+            queryset = queryset.filter(
+                Q(key__icontains=self.contest_query)
+                | Q(name__icontains=self.contest_query)
+            )
+        if self.show_only_rated_contests:
+            queryset = queryset.filter(is_rated=True)
+        return queryset
+
+    def get_context_data(self, **kwargs):
+        context = super(ContestList, self).get_context_data(**kwargs)
+        context["page_type"] = "for_you"
+        context["now"] = self._now
+        context["first_page_href"] = "."
+        context["contest_query"] = self.contest_query
+        context["show_only_rated_contests"] = int(self.show_only_rated_contests)
+        context.update(self.get_sort_context())
+        context.update(self.get_sort_paginate_context())
+        Contest.prefetch_organization_ids(
+            *[contest.id for contest in context["contests"]]
+        )
+        return context
+
+
+class ContestProblemset(ContestMixin, TitleMixin, DetailView):
+    template_name = "contest/problemset.html"
+
+    def get_title(self):
+        contest_name = self.object.name or ""
+        return _("{contest_name} Problemset").format(contest_name=contest_name)
+
+    def get(self, request, *args, **kwargs):
+        self.object = self.get_object()
+        contest = self.object
+
+        # Superusers, editors and testers can always see the problemset
+        if request.user.is_superuser or self.is_editor or self.is_tester:
+            return super().get(request, *args, **kwargs)
+
+        # If contest hasn't started yet (can_join is False when start_time > now), deny access
+        if not contest.can_join:
+            return generic_message(
+                request,
+                _("Problemset not available"),
+                _(
+                    "The contest has not started yet. Please wait until the contest begins."
+                ),
+            )
+
+        # If contest has ended, allow access to everyone
+        if contest.ended:
+            return super().get(request, *args, **kwargs)
+
+        # Contest is ongoing - check if user is currently in the contest with contest mode on
+        # This properly handles windowed contests and respects the "In contest"/"Out contest" toggle
+        is_in_this_contest = (
+            getattr(request, "in_contest", False)
+            and getattr(request, "participation", None) is not None
+            and request.participation.contest == contest
+        )
+        if not is_in_this_contest:
+            return generic_message(
+                request,
+                _("Problemset not available"),
+                _("You must join the contest to view the problemset."),
+            )
+
+        return super().get(request, *args, **kwargs)
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+
+        # Get all contest problems with their details
+        # Filter out quiz-only entries (where problem_id is None)
+        contest_problems = list(
+            self.object.contest_problems.filter(problem_id__isnull=False)
+            .select_related("problem", "problem__data_files")
+            .order_by("order")
+        )
+
+        # Get contest problem IDs for prefetching
+        contest_problem_ids = [cp.problem_id for cp in contest_problems]
+        Problem.prefetch_cache_i18n_name(
+            self.request.LANGUAGE_CODE, *contest_problem_ids
+        )
+
+        context["contest_problems"] = contest_problems
+        context["problems"] = [cp.problem for cp in contest_problems]
+        return context
+
+
+class ContestEdit(LoginRequiredMixin, ContestMixin, TitleMixin, SingleObjectFormView):
+    """
+    Unified edit page for all three contest types (public, org-private,
+    course-private). Permission paths:
+      1. Authors / curators / superusers / `edit_all_contest` perm holders.
+      2. Org admins of any organization owning the contest.
+      3. Teachers / assistants of the course owning the contest.
+    """
+
+    template_name = "contest/edit.html"
+    form_class = ContestEditForm
+
+    def _user_can_edit(self, user, contest):
+        if not user.is_authenticated:
+            return False
+        if contest.is_editable_by(user):
+            return True
+        if hasattr(user, "profile"):
+            for org in contest.organizations.all():
+                if user.profile.can_edit_organization(org):
+                    return True
+            if contest.is_in_course:
+                course_contest = contest.course.first()
+                if course_contest and Course.is_editable_by(
+                    course_contest.course, user.profile
+                ):
+                    return True
+        return False
+
+    def should_bypass_access_check(self, contest):
+        # Editors don't need to "join" a contest to edit it. NOTE: this hook
+        # is invoked from inside ContestMixin.get_object() *before* self.object
+        # is set — use the `contest` argument, never self.object.
+        return self._user_can_edit(self.request.user, contest)
+
+    def dispatch(self, request, *args, **kwargs):
+        if not request.user.is_authenticated:
+            return super().dispatch(request, *args, **kwargs)
+        try:
+            self.object = self.get_object()
+        except PrivateContestError:
+            # Non-editor of an org-private contest: collapse the access-check
+            # exception into the same permission-denied response as below so
+            # the user sees a clean 403, not a 500.
+            return generic_message(
+                request,
+                _("Permission denied"),
+                _("You do not have permission to edit this contest."),
+                status=403,
+            )
+        if not self._user_can_edit(request.user, self.object):
+            return generic_message(
+                request,
+                _("Permission denied"),
+                _("You do not have permission to edit this contest."),
+                status=403,
+            )
+        return super().dispatch(request, *args, **kwargs)
+
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        kwargs["user"] = self.request.user
+        kwargs["instance"] = self.object
+        return kwargs
+
+    def get_rows_formset(self, post=False):
+        return ContestRowFormSet(
+            data=self.request.POST if post else None,
+            prefix="rows",
+            queryset=ContestProblem.objects.filter(contest=self.object).order_by(
+                "order"
+            ),
+        )
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        if "rows_form" not in context:
+            context["rows_form"] = self.get_rows_formset()
+        context["field_sections"] = CONTEST_EDIT_FIELD_SECTIONS
+        # `page_type` is read by `make_tab_item` (templates/three-column-content.html)
+        # to highlight the active sidebar tab.
+        context["page_type"] = "edit"
+        return context
+
+    def get_title(self):
+        return _("Edit %s") % self.object.name
+
+    def post(self, request, *args, **kwargs):
+        # self.object was set in dispatch(); skip the redundant lookup that
+        # SingleObjectFormView.post() would otherwise do.
+        rows_formset = self.get_rows_formset(True)
+        form = self.get_form()
+
+        # Validate BOTH formset and main form before touching the DB.
+        # Otherwise a malformed `format_config` would leave already-deleted
+        # or already-saved rows persisted while the user sees a form error.
+        rows_valid = rows_formset.is_valid()
+        form_valid = form.is_valid()
+        if not rows_valid or not form_valid:
+            return self.render_to_response(
+                self.get_context_data(form=form, rows_form=rows_formset)
+            )
+
+        with transaction.atomic():
+            # First pass: handle deletions.
+            for row_form in rows_formset:
+                if row_form.cleaned_data.get("DELETE") and row_form.instance.pk:
+                    row_form.instance.delete()
+            # Second pass: save valid non-empty rows. The form's clean() flags
+            # empty rows with `_empty_row` so we silently skip them.
+            for row_form in rows_formset.forms:
+                if row_form.cleaned_data.get("DELETE"):
+                    continue
+                if row_form.cleaned_data.get("_empty_row"):
+                    continue
+                instance = row_form.save(commit=False)
+                instance.contest = self.object
+                try:
+                    # Inner savepoint: IntegrityError invalidates the outer
+                    # transaction on PG, so wrap the per-row save so we can
+                    # recover without aborting the whole edit.
+                    with transaction.atomic():
+                        instance.save()
+                except (IntegrityError, ValidationError):
+                    # Resolve unique-constraint conflict by purging the
+                    # existing row for this contest+problem (or contest+quiz)
+                    # pair, then re-saving. Same idiom used by the old
+                    # org-edit view. The retry is also wrapped in its own
+                    # savepoint — if the row violates ANOTHER constraint
+                    # (e.g. unique_together on `order`), the second save
+                    # would otherwise poison the outer transaction.
+                    if instance.problem_id:
+                        ContestProblem.objects.filter(
+                            contest=self.object, problem=instance.problem
+                        ).delete()
+                    elif instance.quiz_id:
+                        ContestProblem.objects.filter(
+                            contest=self.object, quiz=instance.quiz
+                        ).delete()
+                    with transaction.atomic():
+                        instance.save()
+
+            return self.form_valid(form)
+
+    def form_valid(self, form):
+        # SingleObjectFormView inherits FormView (not ModelFormMixin), so
+        # FormView.form_valid does NOT save — call form.save() directly.
+        with revisions.create_revision():
+            revisions.set_comment(_("Edited from site"))
+            revisions.set_user(self.request.user)
+            self.object = form.save()
+            maybe_trigger_contest_rescore(form, self.object, True)
+        messages.success(self.request, _("Contest saved."))
+        return HttpResponseRedirect(self.get_success_url())
+
+    def get_success_url(self):
+        return reverse("contest_edit", args=[self.object.key])

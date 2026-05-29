@@ -3,10 +3,8 @@ import hmac
 import hashlib
 
 from django.conf import settings
-from django.db.models import OuterRef, Count, Subquery, IntegerField, Q
-from django.db.models.functions import Coalesce
 
-from chat_box.models import Ignore, Message, UserRoom, Room
+from chat_box.models import Ignore, UserRoom
 
 from judge.caching import cache_wrapper
 
@@ -24,7 +22,7 @@ def decrypt_url(message_encrypted):
         dec_message = fernet.decrypt(message_encrypted.encode()).decode()
         creator_id, other_id = dec_message.split("_")
         return int(creator_id), int(other_id)
-    except Exception as e:
+    except Exception:
         return None, None
 
 
@@ -39,9 +37,9 @@ def encrypt_channel(channel):
     )
 
 
-@cache_wrapper(prefix="gub")
+@cache_wrapper(prefix="gub2")
 def get_unread_boxes(profile):
-    ignored_rooms = Ignore.get_ignored_rooms(profile)
+    ignored_rooms = Ignore.get_ignored_room_ids(profile)
     unread_boxes = (
         UserRoom.objects.filter(user=profile, unread_count__gt=0)
         .exclude(room__in=ignored_rooms)

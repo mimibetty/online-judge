@@ -2,8 +2,7 @@
   $(function () {
     $('#search-handle').replaceWith($('<select>').attr({
       id: 'search-handle',
-      name: 'handle',
-      onchange: 'form.submit()'
+      name: 'handle'
     }));
     var in_user_redirect = false;
     $('#search-handle').select2({
@@ -20,34 +19,49 @@
       templateResult: function (data, container) {
         return $('<span>')
           .append($('<img>', {
-          'class': 'user-search-image', src: data.gravatar_url,
-          width: 24, height: 24
-        }))
+            'class': 'user-search-image', src: data.gravatar_url,
+            width: 24, height: 24
+          }))
           .append($('<span>', {'class': data.display_rank + ' user-search-name'}).text(data.text))
           .append($('<a>', {href: '/user/' + data.text, 'class': 'user-redirect'})
-            .append($('<i>', {'class': 'fa fa-mail-forward'}))
-            .mouseover(function () {
-            in_user_redirect = true;
-          }).mouseout(function () {
-            in_user_redirect = false;
-          }));
+              .append($('<i>', {'class': 'fa fa-mail-forward'}))
+              .mouseover(function () {
+                in_user_redirect = true;
+              }).mouseout(function () {
+                in_user_redirect = false;
+              }));
+      },
+      templateSelection: function (data) {
+        return data.text || data.id;
       }
     }).on('select2:selecting', function () {
       return !in_user_redirect;
+    }).on('select2:select', function (e) {
+      var selectedData = e.params.data;
+      var username = selectedData.text;
+
+      var $form = $(this).closest('form');
+      var $hiddenHandle = $form.find('input[name="handle"]');
+
+      if ($hiddenHandle.length === 0) {
+        $hiddenHandle = $('<input type="hidden" name="handle">');
+        $form.append($hiddenHandle);
+      }
+
+      $hiddenHandle.val(username);
+
+      $form.submit();
     });
 
-    var $last = null;
-    $(window).on('hashchange', function () {
-      var hash = window.location.hash;
-      if (hash.startsWith('#!')) {
-        var $user = $('#user-' + hash.substring(2)).addClass('highlight');
-        if ($user) {
-          $(document).scrollTop($user.position().top - 50);
-          if ($last !== null) $last.removeClass('highlight');
-          $last = $user;
-        }
+    // Highlight user from ?user= param
+    var userParam = new URLSearchParams(window.location.search).get('user');
+    if (userParam) {
+      var $user = $('#user-' + userParam);
+      if ($user.length) {
+        $user.addClass('highlight');
+        $user[0].scrollIntoView({behavior: 'smooth', block: 'center'});
       }
-    }).trigger('hashchange');
+    }
 
     $('.about-td').on('click', function() {
       var max_height = $(this).css('max-height');

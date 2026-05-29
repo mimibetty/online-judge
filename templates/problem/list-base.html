@@ -22,9 +22,6 @@
       ul.problem-list {
         padding: 0 !important;
       }
-      .volunteer-types {
-        width: 100%;
-      }
       .point-input {
         height: 2em;
         padding-top: 4px;
@@ -101,7 +98,7 @@
         // This is incredibly nasty to do but it's needed because otherwise the select2 steals the focus
         $search.keypress(function (e) {
           if (e.keyCode == 13)
-          $('#go').click();
+            $('#go').click();
         });
 
         $('#random').click(function (e) {
@@ -117,7 +114,7 @@
           prep_form();
           ($('<form>').attr('action', window.location.pathname + '?' + form_serialize())
               .append($('<input>').attr('type', 'hidden').attr('name', 'csrfmiddlewaretoken')
-                .attr('value', $.cookie('csrftoken')))
+                  .attr('value', $.cookie('csrftoken')))
               .attr('method', 'POST').appendTo($('body')).submit());
         });
 
@@ -146,66 +143,11 @@
             $end.prop('disabled', end === point_values.max).val(end);
           });
         }
-        {% if feed_type=='volunteer' and request.user.has_perm('judge.suggest_problem_changes') %}
-          $(".view-statement-src").on('click', function(e) {
-            e.preventDefault();
-            $(this).siblings('.statement-src').toggle();
-          });
-          $(".edit-btn").on('click', function() {
-            var pid = $(this).attr('pid');
-            $('#volunteer-types-' + pid).css({'width': '100%'});
-            $('#volunteer-types-' + pid).select2({multiple: 1, placeholder: '{{ _('Add types...') }}'});
-
-            $('#form-' + pid).show();
-            $('#submit-' + pid).show();
-            $(this).hide();
-          });
-
-          let isChecking = false;
-          $(".volunteer-submit-btn").on('click', function(e) {
-            var pid = $(this).attr('pid');
-            var pcode = $(this).attr('pcode');
-            var $form = $('#form-' + pid);
-
-            if (!$form[0].checkValidity()) {
-              if (isChecking) return;
-              isChecking = true;
-              // The form won't actually submit;
-              $(this).click();
-            }
-            else {
-              isChecking = false;
-            }
-            if (isChecking) return;
-
-            e.preventDefault();
-            $('#volunteer-types-' + pid).select2({multiple: 1, placeholder: '{{ _('Add types...') }}'})
-              .css({'visibility': 'visible'});
-            $('#form-' + pid).hide();
-            $('#edit-' + pid).show();
-            $('#thank-' + pid).show();
-            $(this).hide();
-
-            var data = {
-              problem: pcode,
-              types: $('#volunteer-types-' + pid).val(),
-              knowledge_points: $('#knowledge_point-' + pid).val(),
-              thinking_points: $('#thinking_point-' + pid).val(),
-              feedback: $('#feedback-' + pid).val(),
-            };
-            $.post("{{url('volunteer_problem_vote')}}", data)
-              .fail(function() {
-              $('#thank-' + pid).html("{{_('Fail to vote!')}}");
-            })
-              .done(function() {
-              $('#thank-' + pid).html("{{_('Successful vote! Thank you!')}}");
-            });
-          });
-        {% endif %}
       });
     </script>
   {% endcompress %}
   {% if show_contest_mode %}
+    {% include "contest/pdf-problemset-js.html" %}
     <script type="text/javascript">
       $(function() {
         window.register_contest_notification("{{url('contest_clarification_ajax', request.participation.contest.key)}}");
@@ -213,6 +155,9 @@
         {% if show_contest_mode %}
           $('.left-sidebar').hide();
         {% endif %}
+
+        // Initialize PDF button functionality for contest problemset
+        initContestProblemsetPdf('{{ url("contest_problemset", request.participation.contest.key) }}');
       });
     </script>
     {% compress js %}

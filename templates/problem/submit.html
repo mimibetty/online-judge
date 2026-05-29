@@ -2,6 +2,9 @@
 
 {% block js_media %}
   <script type="text/javascript" src="{{ ACE_URL }}/ace.js"></script>
+  {% if output_only %}
+    <script type="text/javascript" src="{{ static('jszip/jszip.min.js') }}"></script>
+  {% endif %}
   {{ form.media.js }}
   <script type="text/javascript">
     function update_submit_area(code) {
@@ -10,10 +13,33 @@
       window.ace_source.getSession().setValue(code);
     }
 
+    function isOutputLanguage() {
+      return $('#id_language').find('option:selected').attr('data-name') === 'Output';
+    }
+
+    function isFileOnlyLanguage() {
+      var name = $('#id_language').find('option:selected').attr('data-name');
+      return name === 'Output' || name === 'Scratch';
+    }
+
     function update_language_template() {
-      {% if output_only %}
+      if (isFileOnlyLanguage()) {
+        update_submit_area("");
         window.ace_source.env.editor.setReadOnly(true);
-      {% else %}
+        $('#editor').hide();
+        if (isOutputLanguage()) {
+          $('#file-upload-hint').text("{{ _('Upload a .zip file or select multiple output files below.') }}");
+          $('#id_source_file').attr('multiple', true).removeAttr('accept');
+        } else {
+          $('#file-upload-hint').text("{{ _('Upload your .sb3 file below.') }}");
+          $('#id_source_file').removeAttr('multiple').attr('accept', '.sb3');
+        }
+        $('#output-only-upload').show();
+      } else {
+        window.ace_source.env.editor.setReadOnly(false);
+        $('#editor').show();
+        $('#output-only-upload').hide();
+        $('#id_source_file').removeAttr('multiple').removeAttr('accept');
         var source = $('textarea#id_source');
         if (source.val() == window.previous_template.replace(/\r/g, '') || source.val() == '') {
           var lang_id = $('#id_language').val();
@@ -26,11 +52,13 @@
               id: lang_id,
               problem: {{problem_id}}
             }).done(function (template) {
-              update_submit_area(template);
+              if (template && template.trim()) {
+                update_submit_area(template);
+              }
             });
           }
         }
-      {% endif %}
+      }
     }
 
     {% if request.in_contest and next_valid_submit_time and not (submission_limit and submissions_left <= 0) %}
@@ -107,7 +135,7 @@
         $('#id_language').on('select2:open', function (evt) {
           var dropdown = $('.select2-dropdown');
           if (!$('#result-version-info').length)
-          dropdown.append($("<span id=\"result-version-info\">"));
+            dropdown.append($("<span id=\"result-version-info\">"));
           dropdown.attr('id', 'language-select2');
         });
 
@@ -147,8 +175,92 @@
           if ($('#id_source').val().length > 65536) {
             alert("{{ _('Your source code must contain at most 65536 characters.') }}");
             event.preventDefault();
-            $('#problem_submit').find(':submit').attr('disabled', false);
+            return;
           }
+          if (isOutputLanguage()) {
+            var fileInput = $('#id_source_file')[0];
+            if (fileInput && fileInput.files.length > 0) {
+              var files = fileInput.files;
+              var needsZip = files.length > 1 || !files[0].name.endsWith('.zip');
+              var fileResolved = needsZip ? new Promise(function (resolve) {
+                var zip = new JSZip();
+                for (var i = 0; i < files.length; i++) zip.file(files[i].name, files[i]);
+                zip.generateAsync({type: 'blob'}).then(function (blob) {
+                  resolve(new File([blob], 'output.zip', {type: 'application/zip'}));
+                });
+              }) : Promise.resolve(files[0]);
+
+              event.preventDefault();
+              fileResolved.then(function (file) {
+                var BIG = 10 * 1024 * 1024;
+                if (file.size <= BIG) {
+                  // Small file: use existing multipart path
+                  var dataTransfer = new DataTransfer();
+                  dataTransfer.items.add(file);
+                  fileInput.files = dataTransfer.files;
+                  $('#submit-button').prop('disabled', true).val("{{ _('Submitting...') }}");
+                  $('#problem_submit')[0].submit();
+                  return;
+                }
+                // Big file: presigned direct upload
+                $('#submit-button').prop('disabled', true).val("{{ _('Uploading...') }}");
+                var csrf = $('input[name=csrfmiddlewaretoken]').val();
+                $.ajax({
+                  url: '/submission/upload-config',
+                  method: 'POST',
+                  contentType: 'application/json',
+                  headers: {'X-CSRFToken': csrf},
+                  data: JSON.stringify({
+                    filename: file.name,
+                    content_type: file.type || 'application/octet-stream',
+                    file_size: file.size
+                  }),
+                  success: function (config) {
+                    if (config.storage_type === 'local' || !config.upload_url) {
+                      // Fall back to multipart (local storage backend)
+                      var dataTransfer = new DataTransfer();
+                      dataTransfer.items.add(file);
+                      fileInput.files = dataTransfer.files;
+                      $('#submit-button').val("{{ _('Submitting...') }}");
+                      $('#problem_submit')[0].submit();
+                      return;
+                    }
+                    // S3 path
+                    var doUpload;
+                    if (config.method === 'POST' && config.fields) {
+                      var fd = new FormData();
+                      Object.keys(config.fields).forEach(function (k) { fd.append(k, config.fields[k]); });
+                      fd.append('file', file);
+                      doUpload = fetch(config.upload_url, {method: 'POST', body: fd});
+                    } else {
+                      doUpload = fetch(config.upload_url, {
+                        method: config.method || 'PUT',
+                        body: file,
+                        headers: {'Content-Type': file.type || 'application/octet-stream'}
+                      });
+                    }
+                    doUpload.then(function (resp) {
+                      if (!resp.ok) throw new Error('S3 upload failed: ' + resp.status);
+                      $('<input>', {type: 'hidden', name: 'uploaded_file_key', value: config.file_key}).appendTo('#problem_submit');
+                      fileInput.value = '';
+                      $('#submit-button').val("{{ _('Submitting...') }}");
+                      $('#problem_submit')[0].submit();
+                    }).catch(function (err) {
+                      $('#submit-button').prop('disabled', false).val("{{ _('Submit!') }}");
+                      alert('{{ _("Upload failed") }}: ' + err.message);
+                    });
+                  },
+                  error: function (xhr) {
+                    $('#submit-button').prop('disabled', false).val("{{ _('Submit!') }}");
+                    var msg = (xhr.responseJSON && xhr.responseJSON.error) || xhr.statusText;
+                    alert('{{ _("Upload config failed") }}: ' + msg);
+                  }
+                });
+              });
+              return;
+            }
+          }
+          $('#submit-button').prop('disabled', true).val("{{ _('Submitting...') }}");
         });
 
         function get_source_default(file) {
@@ -164,16 +276,22 @@
         }
 
         $('#id_source_file').on('click change', function(e) {
-          var file = $(this)[0].files[0];
-          if (file) {
-            if (file.name.endsWith('zip')) {
-              update_submit_area(file.name);
-            }
-            else if (file.name.endsWith('sb3')) {
-              update_submit_area(file.name);
-            }
-            else {
-              get_source_default(file);
+          var files = $(this)[0].files;
+          if (files.length > 0) {
+            if (isOutputLanguage()) {
+              var names = [];
+              for (var i = 0; i < files.length; i++) {
+                names.push(files[i].name);
+              }
+              update_submit_area(names.join('\n'));
+            } else {
+              var file = files[0];
+              if (file.name.endsWith('zip') || file.name.endsWith('sb3')) {
+                update_submit_area(file.name);
+              }
+              else {
+                get_source_default(file);
+              }
             }
           }
         })
@@ -226,6 +344,10 @@
         {{ form.source.errors }}
         {{ form.source }}
       </div>
+      <div id="output-only-upload" style="display: none;" onclick="document.getElementById('id_source_file').click();">
+        <i class="fa fa-file-archive-o"></i>
+        <span id="file-upload-hint"></span>
+      </div>
       {% if not no_judges %}
         <div id="language">
           {{ form.language.errors }}
@@ -233,9 +355,9 @@
             <select id="id_language" name="language">
               {% for lang in form.fields.language.queryset %}
                 <option value="{{ lang.id }}" data-id="{{ lang.id }}" data-name="{{ lang.name }}"
-                  data-info="{{ lang.info }}" data-ace="{{ lang.ace }}"
-                  data-judge-info="{{ runtime_versions(lang.runtime_versions()) }}"
-                  {% if lang.id == default_lang.id %}selected{% endif %}>{{ lang.name }}</option>
+                        data-info="{{ lang.info }}" data-ace="{{ lang.ace }}"
+                        data-judge-info="{{ runtime_versions(lang.runtime_versions()) }}"
+                        {% if lang.id == default_lang.id %}selected{% endif %}>{{ lang.name }}</option>
               {% endfor %}
             </select>
           </div>
@@ -252,8 +374,8 @@
       {{ form.source_file }}
       <div class="submit-bar">
         {{ form.judge }}
-        <input id="submit-button" type="submit" value="{{ _('Submit!') }}" class="button small"
-          {% if request.in_contest and submission_limit and  submissions_left <= 0 %}disabled{% endif %}>
+        <input id="submit-button" type="submit" value="{{ _('Submit!') }}" class="submit-btn"
+               {% if request.in_contest and submission_limit and  submissions_left <= 0 %}disabled{% endif %}>
         <span id="countdown-timer"></span>
       </div>
     {% endif %}

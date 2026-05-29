@@ -5,7 +5,6 @@ from django.urls import NoReverseMatch, reverse, reverse_lazy
 from django.utils.html import format_html
 from django.utils.translation import gettext_lazy as _
 from mptt.admin import DraggableMPTTAdmin
-from reversion.admin import VersionAdmin
 from reversion_compare.admin import CompareVersionAdmin
 
 
@@ -87,7 +86,6 @@ class BlogPostAdmin(CompareVersionAdmin):
                     "visible",
                     "sticky",
                     "publish_on",
-                    "is_organization_private",
                     "organizations",
                 )
             },

@@ -1,4 +1,4 @@
-@import "vars";
+@use "vars" as *;
 
 .table {
     border-spacing: 0;
@@ -9,11 +9,11 @@
     background: rgba(0, 0, 0, 0.01);
 
     &.striped tr:nth-child(even) {
-        background: #f7f7f7;
+        background: $background_light_gray;
     }
 
     &.striped tr:nth-child(odd) {
-        background: white;
+        background: $surface-primary;
     }
 
     &.no-border {
@@ -27,7 +27,7 @@
     }
 
     tr:last-child td {
-        border-bottom-width: 1px;
+        border-bottom: 1px solid $border_gray;
     }
 
     thead th {
@@ -36,9 +36,9 @@
 
     th {
         height: 2em;
-        color: black;
-        background-color: #DAA520;
-        border-color: #cccccc;
+        color: $text-on-primary;
+        background-color: $theme_color;
+        border-color: $border_gray;
         border-width: 1px 1px 0 0;
         border-style: solid;
         padding: 4px 10px;
@@ -55,11 +55,12 @@
         padding: 7px 5px;
         vertical-align: middle;
         text-align: center;
+        overflow-wrap: break-word;
     }
 }
 
 #users-table th a {
-    color: white;
+    color: $text-on-primary;
 }
 
 .feed-table {

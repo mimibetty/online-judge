@@ -1,12 +1,11 @@
 from django.contrib import admin
-from django.forms import ModelForm, CharField, TextInput
+from django.forms import ModelForm
 from django.utils.html import format_html
-from django.utils.translation import gettext, gettext_lazy as _, ungettext
+from django.utils.translation import gettext, gettext_lazy as _, ngettext
 from django.contrib.auth.admin import UserAdmin as OldUserAdmin
 from django.core.exceptions import ValidationError
 from django.contrib.auth.forms import UserChangeForm
 
-from django_ace import AceWidget
 
 from judge.models import Profile, ProfileInfo
 from judge.widgets import AdminPagedownWidget, AdminSelect2Widget
@@ -21,13 +20,13 @@ class ProfileForm(ModelForm):
         super(ProfileForm, self).__init__(*args, **kwargs)
         if "current_contest" in self.base_fields:
             # form.fields['current_contest'] does not exist when the user has only view permission on the model.
-            self.fields[
-                "current_contest"
-            ].queryset = self.instance.contest_history.select_related("contest").only(
-                "contest__name", "user_id", "virtual"
+            self.fields["current_contest"].queryset = (
+                self.instance.contest_history.select_related("contest").only(
+                    "contest__name", "user_id", "virtual"
+                )
             )
-            self.fields["current_contest"].label_from_instance = (
-                lambda obj: "%s v%d" % (obj.contest.name, obj.virtual)
+            self.fields["current_contest"].label_from_instance = lambda obj: (
+                "%s v%d" % (obj.contest.name, obj.virtual)
                 if obj.virtual
                 else obj.contest.name
             )
@@ -121,6 +120,12 @@ class ProfileAdmin(VersionAdmin):
             fields += ("is_totp_enabled",)
         return fields
 
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
     def show_public(self, obj):
         return format_html(
             '<a href="{0}" style="white-space:nowrap;">{1}</a>',
@@ -161,7 +166,7 @@ class ProfileAdmin(VersionAdmin):
             count += 1
         self.message_user(
             request,
-            ungettext(
+            ngettext(
                 "%d user have scores recalculated.",
                 "%d users have scores recalculated.",
                 count,
@@ -224,4 +229,7 @@ class UserAdmin(OldUserAdmin):
         return fields
 
     def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
         return False

@@ -1,5 +1,5 @@
 from django.db import connection
-from django.utils.translation import gettext as _, gettext_lazy
+from django.utils.translation import gettext_lazy
 
 from judge.contest_format.ioi import IOIContestFormat
 from judge.contest_format.registry import register_contest_format
@@ -25,7 +25,7 @@ class NewIOIContestFormat(IOIContestFormat):
                 for i in hidden_subtasks:
                     try:
                         subtasks.add(int(i))
-                    except Exception as e:
+                    except Exception:
                         pass
             res[str(problem_id)] = subtasks
         return res
@@ -103,7 +103,7 @@ class NewIOIContestFormat(IOIContestFormat):
     def update_participation(self, participation):
         hidden_subtasks = self.get_hidden_subtasks()
 
-        def calculate_format_data(participation, include_frozen):
+        def calculate_format_data(include_frozen):
             format_data = {}
             for (
                 problem_id,
@@ -140,34 +140,41 @@ class NewIOIContestFormat(IOIContestFormat):
 
             return format_data
 
-        def recalculate_results(format_data):
-            cumtime = 0
-            score = 0
+        def normalize_points(format_data):
             for problem_data in format_data.values():
                 if not problem_data["total_points"]:
                     continue
-                penalty = problem_data["time"]
                 problem_data["points"] = (
                     problem_data["points"]
                     / problem_data["total_points"]
                     * problem_data["problem_points"]
                 )
-                if self.config["cumtime"] and problem_data["points"]:
-                    cumtime += penalty
-                score += problem_data["points"]
-            return score, cumtime
 
-        format_data = calculate_format_data(participation, False)
-        score, cumtime = recalculate_results(format_data)
+        # Public scores (excluding hidden subtasks)
+        format_data = calculate_format_data(include_frozen=False)
+        normalize_points(format_data)
+        self.calculate_quiz_scores(participation, format_data)
         self.handle_frozen_state(participation, format_data)
-        participation.cumtime = max(cumtime, 0)
-        participation.score = round(score, self.contest.points_precision)
+
+        participation.score = round(
+            self.compute_score(format_data),
+            self.contest.points_precision,
+        )
+        participation.cumtime = self.compute_cumtime(format_data)
         participation.tiebreaker = 0
         participation.format_data = format_data
 
-        format_data_final = calculate_format_data(participation, True)
-        score_final, cumtime_final = recalculate_results(format_data_final)
-        participation.cumtime_final = max(cumtime_final, 0)
-        participation.score_final = round(score_final, self.contest.points_precision)
+        # Final scores (including hidden subtasks)
+        format_data_final = calculate_format_data(include_frozen=True)
+        normalize_points(format_data_final)
+        self.calculate_quiz_scores(participation, format_data_final)
+
+        participation.score_final = round(
+            self.compute_score(format_data_final),
+            self.contest.points_precision,
+        )
+        participation.cumtime_final = self.compute_cumtime(format_data_final)
         participation.format_data_final = format_data_final
+
+        self.apply_result_hidden(participation, format_data)
         participation.save()

@@ -14,9 +14,7 @@ VAR_INIT = 250**2 * (BETA2 / 212**2)
 SD_INIT = sqrt(VAR_INIT)
 VALID_RANGE = MEAN_INIT - 20 * SD_INIT, MEAN_INIT + 20 * SD_INIT
 VAR_PER_CONTEST = 1219.047619 * (BETA2 / 212**2)
-VAR_LIM = (
-    sqrt(VAR_PER_CONTEST**2 + 4 * BETA2 * VAR_PER_CONTEST) - VAR_PER_CONTEST
-) / 2
+VAR_LIM = (sqrt(VAR_PER_CONTEST**2 + 4 * BETA2 * VAR_PER_CONTEST) - VAR_PER_CONTEST) / 2
 SD_LIM = sqrt(VAR_LIM)
 TANH_C = sqrt(3) / pi
 
@@ -145,8 +143,8 @@ def recalculate_ratings(ranking, old_mean, times_ranked, historical_p):
 
 def rate_contest(contest):
     from judge.models import Rating, Profile
-    from judge.models.profile import _get_basic_info
-    from judge.utils.users import get_contest_ratings, get_rating_rank
+    from judge.models.profile import get_rating_rank
+    from judge.utils.users import get_contest_ratings
 
     rating_subquery = Rating.objects.filter(user=OuterRef("user"))
     rating_sorted = rating_subquery.order_by("-contest__end_time")
@@ -238,9 +236,12 @@ def rate_contest(contest):
             )
         )
 
-    _get_basic_info.dirty_multi([(uid,) for uid in user_ids])
-    get_contest_ratings.dirty_multi([(uid,) for uid in user_ids])
-    get_rating_rank.dirty_multi([(uid,) for uid in user_ids])
+        def _dirty_caches():
+            Profile.dirty_cache(*user_ids)
+            get_contest_ratings.dirty_multi([(uid,) for uid in user_ids])
+            get_rating_rank.dirty_multi([(uid,) for uid in user_ids])
+
+        transaction.on_commit(_dirty_caches)
 
 
 RATING_LEVELS = [

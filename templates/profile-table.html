@@ -5,7 +5,7 @@
       <div class="profile-card">
         <div class="card-header">
           <a href="{{url('user_page')}}">
-            <img class="avatar" src="{{ gravatar(request.profile) }}" alt="User Avatar">
+            <img class="user-img" src="{{ gravatar(request.profile.id) }}" alt="User Avatar">
           </a>
           <h4>{{ link_user(request.profile) }}</h4>
         </div>
@@ -17,11 +17,11 @@
           <div class="user-info">
             <div
               title="
-                {%- trans trimmed counter=request.profile.problem_count %}
-                  {{ counter }} problem solved
-                  {% pluralize %}
-                  {{ counter }} problems solved
-                {% endtrans -%}"
+                     {%- trans trimmed counter=request.profile.problem_count %}
+                       {{ counter }} problem solved
+                       {% pluralize %}
+                       {{ counter }} problems solved
+                     {% endtrans -%}"
             ><i class="green icofont-tick-mark"></i> {{_('Problems')}}</div>
             <span class="user-info-body">{{ request.profile.problem_count }}</span>
           </div>

@@ -1,22 +1,18 @@
 from operator import attrgetter
 
 from django import forms
-from django.contrib import admin, messages
-from django.db import transaction, IntegrityError
-from django.db.models import Q, Avg, Count
-from django.db.models.aggregates import StdDev
+from django.contrib import admin
+from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.db.models import Q
 from django.forms import ModelForm, TextInput
 from django.urls import reverse_lazy
-from django.utils.html import format_html
-from django.utils.translation import gettext, gettext_lazy as _, ungettext
-from django_ace import AceWidget
 from django.utils import timezone
-from django.core.exceptions import ValidationError
-
-from reversion.admin import VersionAdmin
+from django.utils.html import format_html
+from django.utils.translation import gettext, gettext_lazy as _, ngettext
 from reversion_compare.admin import CompareVersionAdmin
 
-
+from django_ace import AceWidget
 from judge.models import (
     LanguageLimit,
     LanguageTemplate,
@@ -24,9 +20,9 @@ from judge.models import (
     ProblemTranslation,
     Profile,
     Solution,
-    Notification,
 )
-from judge.models.notification import make_notification
+from judge.models.notification import Notification, NotificationCategory
+
 from judge.widgets import (
     AdminHeavySelect2MultipleWidget,
     AdminSelect2MultipleWidget,
@@ -34,7 +30,6 @@ from judge.widgets import (
     CheckboxSelectMultipleWithSelectAll,
     HeavyPreviewAdminPageDownWidget,
 )
-from judge.utils.problems import user_editable_ids, user_tester_ids
 
 MEMORY_UNITS = (("KB", "KB"), ("MB", "MB"))
 
@@ -69,7 +64,7 @@ class ProblemForm(ModelForm):
 
     def clean(self):
         memory_unit = self.cleaned_data.get("memory_unit", "KB")
-        if memory_unit == "MB":
+        if memory_unit == "MB" and "memory_limit" in self.cleaned_data:
             self.cleaned_data["memory_limit"] *= 1024
         date = self.cleaned_data.get("date")
         if not date or date > timezone.now():
@@ -205,7 +200,7 @@ class ProblemTranslationInline(admin.StackedInline):
 class ProblemAdmin(CompareVersionAdmin):
     fieldsets = (
         (
-            None,
+            _("Content"),
             {
                 "fields": (
                     "code",
@@ -224,11 +219,21 @@ class ProblemAdmin(CompareVersionAdmin):
         ),
         (
             _("Social Media"),
-            {"classes": ("collapse",), "fields": ("og_image", "summary")},
+            {"fields": ("og_image", "summary")},
         ),
         (_("Taxonomy"), {"fields": ("types", "group")}),
-        (_("Points"), {"fields": (("points", "partial"), "short_circuit")}),
-        (_("Limits"), {"fields": ("time_limit", ("memory_limit", "memory_unit"))}),
+        (
+            _("Points"),
+            {
+                "fields": (("points", "partial"), "short_circuit"),
+            },
+        ),
+        (
+            _("Limits"),
+            {
+                "fields": ("time_limit", ("memory_limit", "memory_unit")),
+            },
+        ),
         (_("Language"), {"fields": ("allowed_languages",)}),
         (_("Justice"), {"fields": ("banned_users",)}),
         (_("History"), {"fields": ("change_message",)}),
@@ -303,7 +308,7 @@ class ProblemAdmin(CompareVersionAdmin):
             self._rescore(request, problem_id)
         self.message_user(
             request,
-            ungettext(
+            ngettext(
                 "%d problem successfully marked as public.",
                 "%d problems successfully marked as public.",
                 count,
@@ -319,7 +324,7 @@ class ProblemAdmin(CompareVersionAdmin):
             self._rescore(request, problem_id)
         self.message_user(
             request,
-            ungettext(
+            ngettext(
                 "%d problem successfully marked as private.",
                 "%d problems successfully marked as private.",
                 count,
@@ -366,6 +371,8 @@ class ProblemAdmin(CompareVersionAdmin):
 
     def save_model(self, request, obj, form, change):
         form.changed_data.remove("memory_unit")
+        # Allow superusers to bypass points cap for non-public problems
+        obj._bypass_points_cap = request.user.is_superuser
         super().save_model(request, obj, form, change)
         if form.changed_data and any(
             f in form.changed_data for f in ("is_public", "points", "partial")
@@ -373,47 +380,38 @@ class ProblemAdmin(CompareVersionAdmin):
             self._rescore(request, obj.id)
 
     def save_related(self, request, form, formsets, change):
-        editors = set()
-        testers = set()
-        if "curators" in form.changed_data or "authors" in form.changed_data:
-            editors = set(form.instance.editor_ids)
-        if "testers" in form.changed_data:
-            testers = set(form.instance.tester_ids)
-
         super().save_related(request, form, formsets, change)
         obj = form.instance
         obj.curators.add(request.profile)
 
-        if "curators" in form.changed_data or "authors" in form.changed_data:
-            del obj.editor_ids
-            editors = editors.union(set(obj.editor_ids))
-        if "testers" in form.changed_data:
-            del obj.tester_ids
-            testers = testers.union(set(obj.tester_ids))
-
-        for editor in editors:
-            user_editable_ids.dirty(editor)
-        for tester in testers:
-            user_tester_ids.dirty(tester)
+        # Cache invalidation for user_editable_ids and user_tester_ids
+        # is handled by m2m_changed signals in judge/signals/problem.py
 
         # Create notification
         if "is_public" in form.changed_data or "organizations" in form.changed_data:
-            users = set(obj.authors.all())
-            users = users.union(users, set(obj.curators.all()))
+            to_user_ids = obj.get_author_ids() + obj.get_curator_ids()
             orgs = []
             if obj.organizations.count() > 0:
                 for org in obj.organizations.all():
-                    users = users.union(users, set(org.admins.all()))
+                    to_user_ids += org.get_admin_ids()
                     orgs.append(org.name)
             else:
-                admins = Profile.objects.filter(user__is_superuser=True).all()
-                users = users.union(users, admins)
+                admins = Profile.objects.filter(user__is_superuser=True).values_list(
+                    "id", flat=True
+                )
+                to_user_ids += list(admins)
+            to_user_ids = list(set(to_user_ids))
             link = reverse_lazy("admin:judge_problem_change", args=(obj.id,))
             html = f'<a href="{link}">{obj.name}</a>'
             category = "Problem public: " + str(obj.is_public)
             if orgs:
                 category += " (" + ", ".join(orgs) + ")"
-            make_notification(users, category, html, request.profile)
+            Notification.objects.bulk_create_notifications(
+                user_ids=to_user_ids,
+                category=NotificationCategory.PROBLEM,
+                html_link=html,
+                author=request.profile,
+            )
 
     def construct_change_message(self, request, form, *args, **kwargs):
         if form.cleaned_data.get("change_message"):

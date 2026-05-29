@@ -3,9 +3,7 @@ from datetime import timedelta
 from django.core.exceptions import ValidationError
 from django.db import connection
 from django.template.defaultfilters import floatformat
-from django.urls import reverse
 from django.utils.html import format_html
-from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy
 
 from judge.contest_format.default import DefaultContestFormat
@@ -55,9 +53,7 @@ class ECOOContestFormat(DefaultContestFormat):
         self.config.update(config or {})
         self.contest = contest
 
-    def update_participation(self, participation):
-        cumtime = 0
-        points = 0
+    def gather_results(self, participation):
         format_data = {}
 
         frozen_time = self.contest.end_time
@@ -95,8 +91,6 @@ class ECOOContestFormat(DefaultContestFormat):
             for score, time, prob, subs, max_score in cursor.fetchall():
                 time = from_database_time(time)
                 dt = (time - participation.start).total_seconds()
-                if self.config["cumtime"]:
-                    cumtime += dt
 
                 bonus = 0
                 if score > 0:
@@ -110,20 +104,36 @@ class ECOOContestFormat(DefaultContestFormat):
                             // 60
                             // self.config["time_bonus"]
                         )
-                    points += bonus
 
                 format_data[str(prob)] = {"time": dt, "points": score, "bonus": bonus}
-                points += score
 
-        self.handle_frozen_state(participation, format_data)
-        participation.cumtime = cumtime
-        participation.score = round(points, self.contest.points_precision)
-        participation.tiebreaker = 0
-        participation.format_data = format_data
-        participation.save()
+        return format_data
+
+    def compute_score(self, format_data, entries=None):
+        score = 0
+        for key, entry in format_data.items():
+            if entries is not None and key not in entries:
+                continue
+            score += entry.get("points", 0)
+            score += entry.get("bonus", 0)
+        return max(score, 0)
+
+    def compute_cumtime(self, format_data, entries=None):
+        if not self.config.get("cumtime"):
+            return 0
+        cumtime = 0
+        for key, entry in format_data.items():
+            if entries is not None and key not in entries:
+                continue
+            cumtime += entry.get("time", 0)
+        return cumtime
 
     def display_user_problem(self, participation, contest_problem, show_final=False):
-        format_data = (participation.format_data or {}).get(str(contest_problem.id))
+        if contest_problem.quiz_id:
+            format_key = f"quiz_{contest_problem.id}"
+        else:
+            format_key = str(contest_problem.id)
+        format_data = (participation.format_data or {}).get(format_key)
         if format_data:
             bonus = (
                 format_html(
@@ -132,41 +142,16 @@ class ECOOContestFormat(DefaultContestFormat):
                 if format_data.get("bonus")
                 else ""
             )
-
-            return format_html(
-                '<td class="{state}"><a data-featherlight="{url}" href="#">{points}{bonus}<div class="solving-time">{time}</div></a></td>',
-                state=(
-                    (
-                        "pretest-"
-                        if self.contest.run_pretests_only
-                        and contest_problem.is_pretested
-                        else ""
-                    )
-                    + self.best_solution_state(
-                        format_data["points"], contest_problem.points
-                    )
-                    + (" frozen" if format_data.get("frozen") else "")
-                ),
-                url=reverse(
-                    "contest_user_submissions_ajax",
-                    args=[
-                        self.contest.key,
-                        participation.id,
-                        contest_problem.problem.code,
-                    ],
-                ),
+            return self.display_problem_cell(
+                participation,
+                contest_problem,
+                format_data,
                 points=floatformat(format_data["points"]),
-                bonus=bonus,
-                time=nice_repr(timedelta(seconds=format_data["time"]), "noday"),
+                extra=bonus,
+                time=nice_repr(
+                    timedelta(seconds=format_data["time"]), "noday-no-seconds"
+                ),
+                time_seconds=int(format_data["time"]),
             )
         else:
-            return mark_safe("<td></td>")
-
-    def display_participation_result(self, participation, show_final=False):
-        return format_html(
-            '<td class="user-points">{points}<div class="solving-time">{cumtime}</div></td>',
-            points=floatformat(participation.score),
-            cumtime=nice_repr(timedelta(seconds=participation.cumtime), "noday")
-            if self.config["cumtime"]
-            else "",
-        )
+            return self.display_empty_cell(contest_problem)

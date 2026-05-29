@@ -15,5 +15,27 @@ sass_processed
 <desired bridge log path>
 node_modules/
 package-lock.json
+package.json
 /src
+websocket/config.js
 
+.DS_Store
+# AI tools (synced from separate private repo via .claude-config/sync.sh)
+CLAUDE.md
+**/CLAUDE.md
+Roo.md
+AGENTS.md
+plan/
+.claude/
+.codex/
+.claude-config/
+
+# Playwright & temporary files
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
+.playwright-mcp/
+playwright.config.ts
+tmp/

@@ -13,7 +13,8 @@ from django.utils.translation import gettext as _, gettext_noop
 from django.http import Http404
 
 from judge.models import Problem, Submission
-from judge.ml.collab_filter import CollabFilter
+from judge.models.course import BestSubmission
+from judge.ml.vector_store import VectorStore
 from judge.caching import cache_wrapper
 
 __all__ = [
@@ -25,7 +26,7 @@ __all__ = [
 ]
 
 
-@cache_wrapper(prefix="user_tester")
+@cache_wrapper(prefix="user_tester_v2")
 def user_tester_ids(profile):
     return set(
         Problem.testers.through.objects.filter(profile=profile)
@@ -34,7 +35,7 @@ def user_tester_ids(profile):
     )
 
 
-@cache_wrapper(prefix="user_editable")
+@cache_wrapper(prefix="user_editable_v2")
 def user_editable_ids(profile):
     result = set(
         (
@@ -62,11 +63,9 @@ def contest_completed_ids(participation):
 @cache_wrapper(prefix="user_complete")
 def user_completed_ids(profile):
     result = set(
-        Submission.objects.filter(
-            user=profile, result="AC", points=F("problem__points")
-        )
-        .values_list("problem_id", flat=True)
-        .distinct()
+        BestSubmission.objects.filter(
+            user=profile, points__gte=F("case_total"), case_total__gt=0
+        ).values_list("problem_id", flat=True)
     )
     return result
 
@@ -89,20 +88,22 @@ def contest_attempted_ids(participation):
 @cache_wrapper(prefix="user_attempted")
 def user_attempted_ids(profile):
     result = {
-        id: {
-            "achieved_points": points,
-            "max_points": max_points,
-            "last_submission": last_submission,
-            "code": problem_code,
-            "name": problem_name,
+        bs["problem_id"]: {
+            "achieved_points": bs["points"],
+            "max_points": bs["case_total"],
+            "last_submission": bs["submission_id"],
+            "code": bs["problem__code"],
+            "name": bs["problem__name"],
         }
-        for id, max_points, problem_code, problem_name, points, last_submission in (
-            Submission.objects.filter(user=profile)
-            .values_list(
-                "problem__id", "problem__points", "problem__code", "problem__name"
-            )
-            .annotate(points=Max("points"), last_submission=Max("id"))
-            .filter(points__lt=F("problem__points"))
+        for bs in BestSubmission.objects.filter(user=profile)
+        .exclude(points__gte=F("case_total"), case_total__gt=0)
+        .values(
+            "problem_id",
+            "problem__code",
+            "problem__name",
+            "points",
+            "case_total",
+            "submission_id",
         )
     }
     return result
@@ -112,7 +113,7 @@ def _get_result_data(results):
     return {
         "categories": [
             # Using gettext_noop here since this will be tacked into the cache, so it must be language neutral.
-            # The caller, SubmissionList.get_result_data will run ugettext on the name.
+            # The caller, SubmissionList.get_result_data will run gettext on the name.
             {"code": "AC", "name": gettext_noop("Accepted"), "count": results["AC"]},
             {
                 "code": "WA",
@@ -234,24 +235,26 @@ def hot_problems(duration, limit):
 
 @cache_wrapper(prefix="grp", timeout=14400)
 def get_related_problems(profile, problem, limit=8):
-    if not profile or not settings.ML_OUTPUT_PATH:
+    if not profile or not getattr(settings, "USE_ML", False):
         return None
     problemset = Problem.get_visible_problems(profile.user).values_list("id", flat=True)
     problemset = problemset.exclude(id__in=user_completed_ids(profile))
     problemset = problemset.exclude(id=problem.id)
-    cf_model = CollabFilter("collab_filter")
-    results = cf_model.problem_neighbors(
-        problem, problemset, CollabFilter.DOT, limit
-    ) + cf_model.problem_neighbors(problem, problemset, CollabFilter.COSINE, limit)
+
+    two_tower_model = VectorStore("two_tower")
+    results = two_tower_model.problem_neighbors(problem, problemset, limit * 2)
+    if not results:
+        cf_model = VectorStore("collab_filter")
+        results = cf_model.problem_neighbors(problem, problemset, limit * 2)
+
     results = list(set([i[1] for i in results]))
-    seed = datetime.now().strftime("%d%m%Y")
+    random.seed(datetime.now().strftime("%d%m%Y"))
     random.shuffle(results)
     results = results[:limit]
-    results = [Problem.objects.get(id=i) for i in results]
-    return results
+    return Problem.get_cached_instances(*results)
 
 
-def finished_submission(sub):
+def finished_submission(sub, is_delete=False):
     keys = ["user_complete:%d" % sub.user_id, "user_attempted:%s" % sub.user_id]
     if hasattr(sub, "contest"):
         participation = sub.contest.participation
@@ -259,16 +262,38 @@ def finished_submission(sub):
         keys += ["contest_attempted:%d" % participation.id]
     cache.delete_many(keys)
 
+    if sub.result == "AC":
+        # Avoid circular import: contest_recommendation imports user_completed_ids from here
+        from judge.utils.contest_recommendation import (
+            get_recommended_contests,
+            _get_user_skill,
+        )
+
+        get_recommended_contests.dirty(sub.user)  # sub.user is the Profile object
+        _get_user_skill.dirty(sub.user)
+
+    # Update best submission cache for course lesson grade tracking
+    if is_delete:
+        # When deleting, recalculate best submission for this user/problem
+        # The CASCADE delete will remove BestSubmission if it pointed to this submission,
+        # so we need to find and set the new best submission from remaining ones
+        BestSubmission.recalculate_for_user_problem(sub.user_id, sub.problem_id)
+    else:
+        BestSubmission.update_from_submission(sub)
+
 
 class RecommendationType(Enum):
     HOT_PROBLEM = 1
-    CF_DOT = 2
-    CF_COSINE = 3
-    CF_TIME_DOT = 4
-    CF_TIME_COSINE = 5
+    CF = 2
+    CF_TIME = 4
+    TWO_TOWER = 5
 
 
-# Return a list of list. Each inner list correspond to each type in types
+@cache_wrapper(prefix="cf_rec", timeout=3600)
+def _cached_user_recommendations(model_name, user_id, problem_ids, limit):
+    return VectorStore(model_name).user_recommendations(user_id, problem_ids, limit)
+
+
 def get_user_recommended_problems(
     user_id,
     problem_ids,
@@ -276,9 +301,6 @@ def get_user_recommended_problems(
     limits,
     shuffle=False,
 ):
-    cf_model = CollabFilter("collab_filter")
-    cf_time_model = CollabFilter("collab_filter_time")
-
     def get_problem_ids_from_type(rec_type, limit):
         if type(rec_type) == int:
             try:
@@ -291,39 +313,53 @@ def get_user_recommended_problems(
                 for problem in hot_problems(timedelta(days=7), limit)
                 if problem.id in set(problem_ids)
             ]
-        if rec_type == RecommendationType.CF_DOT:
-            return cf_model.user_recommendations(
-                user_id, problem_ids, cf_model.DOT, limit
+        if rec_type == RecommendationType.CF:
+            return _cached_user_recommendations(
+                "collab_filter", user_id, problem_ids, limit
             )
-        if rec_type == RecommendationType.CF_COSINE:
-            return cf_model.user_recommendations(
-                user_id, problem_ids, cf_model.COSINE, limit
+        if rec_type == RecommendationType.CF_TIME:
+            return _cached_user_recommendations(
+                "collab_filter_time", user_id, problem_ids, limit
             )
-        if rec_type == RecommendationType.CF_TIME_DOT:
-            return cf_time_model.user_recommendations(
-                user_id, problem_ids, cf_model.DOT, limit
-            )
-        if rec_type == RecommendationType.CF_TIME_COSINE:
-            return cf_time_model.user_recommendations(
-                user_id, problem_ids, cf_model.COSINE, limit
+        if rec_type == RecommendationType.TWO_TOWER:
+            return _cached_user_recommendations(
+                "two_tower", user_id, problem_ids, limit
             )
         return []
 
     all_problems = []
     for rec_type, limit in zip(recommendation_types, limits):
         all_problems += get_problem_ids_from_type(rec_type, limit)
-    if shuffle:
-        seed = datetime.now().strftime("%d%m%Y")
-        random.Random(seed).shuffle(all_problems)
 
-    # deduplicate problems
-    res = []
-    used_pid = set()
-
+    # deduplicate, preserving scores where available
+    seen = set()
+    deduped = []
     for obj in all_problems:
         if type(obj) == tuple:
-            obj = obj[1]
-        if obj not in used_pid:
-            res.append(obj)
-            used_pid.add(obj)
-    return res
+            score, pid = obj
+        else:
+            score, pid = 0.0, obj
+        if pid not in seen:
+            deduped.append((score, pid))
+            seen.add(pid)
+
+    if shuffle and deduped:
+        # Weighted shuffle: higher-scored items more likely near top
+        seed = datetime.now().strftime("%d%m%Y")
+        rng = random.Random(seed)
+        result = []
+        remaining = list(deduped)
+        while remaining:
+            weights = [max(s, 0.01) ** 3 for s, _ in remaining]
+            total = sum(weights)
+            r = rng.random() * total
+            cumulative = 0
+            for i, (s, pid) in enumerate(remaining):
+                cumulative += weights[i]
+                if cumulative >= r:
+                    result.append(pid)
+                    remaining.pop(i)
+                    break
+        return result
+
+    return [pid for _, pid in deduped]

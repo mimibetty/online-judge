@@ -1,4 +1,4 @@
-from django.conf.urls import url
+from django.urls import re_path
 from django.contrib import admin
 from django.core.exceptions import PermissionDenied
 from django.db import connection, transaction
@@ -9,8 +9,7 @@ from django.shortcuts import get_object_or_404
 from django.urls import reverse, reverse_lazy
 from django.utils import timezone
 from django.utils.html import format_html
-from django.utils.translation import gettext_lazy as _, ungettext
-from reversion.admin import VersionAdmin
+from django.utils.translation import gettext_lazy as _, ngettext
 from reversion_compare.admin import CompareVersionAdmin
 
 from django_ace import AceWidget
@@ -77,6 +76,7 @@ class ContestProblemInlineForm(ModelForm):
     class Meta:
         widgets = {
             "problem": AdminHeavySelect2Widget(data_view="problem_select2"),
+            "quiz": AdminSelect2Widget,
             "hidden_subtasks": TextInput(attrs={"size": "3"}),
             "points": TextInput(attrs={"size": "1"}),
             "order": TextInput(attrs={"size": "1"}),
@@ -89,11 +89,13 @@ class ContestProblemInline(admin.TabularInline):
     verbose_name_plural = "Problems"
     fields = (
         "problem",
+        "quiz",
         "points",
         "partial",
         "is_pretested",
         "max_submissions",
         "hidden_subtasks",
+        "is_result_hidden",
         "show_testcases",
         "order",
         "rejudge_column",
@@ -335,7 +337,7 @@ class ContestAdmin(CompareVersionAdmin):
         count = queryset.update(is_visible=True)
         self.message_user(
             request,
-            ungettext(
+            ngettext(
                 "%d contest successfully marked as visible.",
                 "%d contests successfully marked as visible.",
                 count,
@@ -353,7 +355,7 @@ class ContestAdmin(CompareVersionAdmin):
         count = queryset.update(is_visible=True)
         self.message_user(
             request,
-            ungettext(
+            ngettext(
                 "%d contest successfully marked as hidden.",
                 "%d contests successfully marked as hidden.",
                 count,
@@ -365,9 +367,9 @@ class ContestAdmin(CompareVersionAdmin):
 
     def get_urls(self):
         return [
-            url(r"^rate/all/$", self.rate_all_view, name="judge_contest_rate_all"),
-            url(r"^(\d+)/rate/$", self.rate_view, name="judge_contest_rate"),
-            url(
+            re_path(r"^rate/all/$", self.rate_all_view, name="judge_contest_rate_all"),
+            re_path(r"^(\d+)/rate/$", self.rate_view, name="judge_contest_rate"),
+            re_path(
                 r"^(\d+)/judge/(\d+)/$", self.rejudge_view, name="judge_contest_rejudge"
             ),
         ] + super(ContestAdmin, self).get_urls()
@@ -381,7 +383,7 @@ class ContestAdmin(CompareVersionAdmin):
 
         self.message_user(
             request,
-            ungettext(
+            ngettext(
                 "%d submission was successfully scheduled for rejudging.",
                 "%d submissions were successfully scheduled for rejudging.",
                 len(queryset),
@@ -489,7 +491,7 @@ class ContestParticipationAdmin(admin.ModelAdmin):
             count += 1
         self.message_user(
             request,
-            ungettext(
+            ngettext(
                 "%d participation recalculated.",
                 "%d participations recalculated.",
                 count,

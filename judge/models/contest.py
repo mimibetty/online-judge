@@ -1,16 +1,16 @@
+from datetime import timezone as datetime_timezone
+
+from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
 from django.db import models, transaction
-from django.db.models import CASCADE, Q
-from django.db.models.signals import m2m_changed
+from django.db.models import CASCADE, Q, Count, Max, Min
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.functional import cached_property
 from django.utils.translation import gettext, gettext_lazy as _
 from django.contrib.contenttypes.fields import GenericRelation
-from django.dispatch import receiver
 
-from jsonfield import JSONField
 from lupa import LuaRuntime
 from moss import (
     MOSS_LANG_C,
@@ -43,6 +43,8 @@ __all__ = [
     "OfficialContest",
     "OfficialContestCategory",
     "OfficialContestLocation",
+    "get_contest_problem_ids",
+    "get_global_rating_range",
 ]
 
 
@@ -97,13 +99,13 @@ class Contest(models.Model, PageVotable, Bookmarkable):
         (SCOREBOARD_AFTER_PARTICIPATION, _("Hidden for duration of participation")),
     )
     key = models.CharField(
-        max_length=20,
+        max_length=30,
         verbose_name=_("contest id"),
         unique=True,
         validators=[RegexValidator("^[a-z0-9]+$", _("Contest id must be ^[a-z0-9]+$"))],
     )
     name = models.CharField(
-        max_length=100, verbose_name=_("contest name"), db_index=True
+        max_length=150, verbose_name=_("contest name"), db_index=True
     )
     authors = models.ManyToManyField(
         Profile,
@@ -288,7 +290,7 @@ class Contest(models.Model, PageVotable, Bookmarkable):
     )
     banned_users = models.ManyToManyField(
         Profile,
-        verbose_name=_("personae non gratae"),
+        verbose_name=_("Banned users"),
         blank=True,
         help_text=_("Bans the selected users from joining this contest."),
     )
@@ -299,7 +301,7 @@ class Contest(models.Model, PageVotable, Bookmarkable):
         choices=contest_format.choices(),
         help_text=_("The contest format module to use."),
     )
-    format_config = JSONField(
+    format_config = models.JSONField(
         verbose_name=_("contest format configuration"),
         null=True,
         blank=True,
@@ -375,9 +377,15 @@ class Contest(models.Model, PageVotable, Bookmarkable):
                 )
 
     def save(self, *args, **kwargs):
-        earliest_start_time = datetime(2020, 1, 1).replace(tzinfo=timezone.utc)
+        earliest_start_time = datetime(1999, 5, 4).replace(tzinfo=datetime_timezone.utc)
         if self.start_time < earliest_start_time:
             self.start_time = earliest_start_time
+
+        # If start_time is more than a year from now, set it to a year from now
+        now = timezone.now()
+        one_year_from_now = now + timedelta(days=365)
+        if self.start_time > one_year_from_now:
+            self.start_time = one_year_from_now
 
         if self.end_time < self.start_time:
             self.end_time = self.start_time + timedelta(hours=1)
@@ -390,7 +398,13 @@ class Contest(models.Model, PageVotable, Bookmarkable):
         if self.time_limit and self.time_limit > max_duration:
             self.time_limit = max_duration
 
+        if self.freeze_after and self.freeze_after > max_duration:
+            self.freeze_after = max_duration
+
         super().save(*args, **kwargs)
+
+        if not hasattr(self, "_updating_stats_only"):
+            cache.delete_many(["generated-meta-contest:%d" % self.id])
 
     def is_in_contest(self, user):
         if user.is_authenticated:
@@ -410,6 +424,18 @@ class Contest(models.Model, PageVotable, Bookmarkable):
         if not self.show_scoreboard and not self.is_in_contest(user):
             return False
         return True
+
+    def can_see_problems(self, user):
+        if user.is_authenticated:
+            if user.has_perm("judge.see_private_contest") or user.has_perm(
+                "judge.edit_all_contest"
+            ):
+                return True
+            if user.profile.id in self.editor_ids:
+                return True
+            if user.profile.id in self.tester_ids:
+                return True
+        return self.can_join
 
     def can_see_full_scoreboard(self, user):
         if self.show_scoreboard:
@@ -491,6 +517,9 @@ class Contest(models.Model, PageVotable, Bookmarkable):
             )
         )
 
+    def get_author_ids(self):
+        return list(self._author_ids())
+
     @cache_wrapper(prefix="Coci")
     def _curator_ids(self):
         return set(
@@ -518,6 +547,18 @@ class Contest(models.Model, PageVotable, Bookmarkable):
     @cached_property
     def tester_ids(self):
         return self._tester_ids()
+
+    def get_organization_ids(self):
+        return _get_contest_organization_ids(self.id)
+
+    @classmethod
+    def prefetch_organization_ids(cls, *contest_ids):
+        """Prefetch organization IDs for multiple contests"""
+        _get_contest_organization_ids.batch([(id,) for id in contest_ids])
+
+    def get_organizations(self):
+        organization_ids = self.get_organization_ids()
+        return Organization.get_cached_instances(*organization_ids)
 
     def __str__(self):
         return f"{self.name} ({self.key})"
@@ -641,10 +682,14 @@ class Contest(models.Model, PageVotable, Bookmarkable):
             )
             or show_own_contests_only
         ):
-            q = Q(is_visible=True, is_in_course=False)
+            q = Q(is_visible=True)
             q &= (
                 Q(view_contest_scoreboard=user.profile)
-                | Q(is_organization_private=False, is_private=False)
+                | Q(
+                    is_organization_private=False,
+                    is_private=False,
+                    is_in_course=False,
+                )
                 | Q(
                     is_organization_private=False,
                     is_private=True,
@@ -660,6 +705,10 @@ class Contest(models.Model, PageVotable, Bookmarkable):
                     is_private=True,
                     organizations__in=user.profile.organizations.all(),
                     private_contestants=user.profile,
+                )
+                | Q(
+                    is_in_course=True,
+                    course__course__courserole__user=user.profile,
                 )
             )
 
@@ -696,20 +745,6 @@ class Contest(models.Model, PageVotable, Bookmarkable):
         verbose_name_plural = _("contests")
 
 
-@receiver(m2m_changed, sender=Contest.organizations.through)
-def update_organization_private(sender, instance, **kwargs):
-    if kwargs["action"] in ["post_add", "post_remove", "post_clear"]:
-        instance.is_organization_private = instance.organizations.exists()
-        instance.save(update_fields=["is_organization_private"])
-
-
-@receiver(m2m_changed, sender=Contest.private_contestants.through)
-def update_private(sender, instance, **kwargs):
-    if kwargs["action"] in ["post_add", "post_remove", "post_clear"]:
-        instance.is_private = instance.private_contestants.exists()
-        instance.save(update_fields=["is_private"])
-
-
 class ContestParticipation(models.Model):
     LIVE = 0
     SPECTATE = -1
@@ -730,7 +765,7 @@ class ContestParticipation(models.Model):
         verbose_name=_("start time"), default=timezone.now, db_column="start"
     )
     score = models.FloatField(verbose_name=_("score"), default=0, db_index=True)
-    cumtime = models.PositiveIntegerField(verbose_name=_("cumulative time"), default=0)
+    cumtime = models.BigIntegerField(verbose_name=_("cumulative time"), default=0)
     is_disqualified = models.BooleanField(
         verbose_name=_("is disqualified"),
         default=False,
@@ -742,16 +777,16 @@ class ContestParticipation(models.Model):
         default=LIVE,
         help_text=_("0 means non-virtual, otherwise the n-th virtual participation."),
     )
-    format_data = JSONField(
+    format_data = models.JSONField(
         verbose_name=_("contest format specific data"), null=True, blank=True
     )
-    format_data_final = JSONField(
+    format_data_final = models.JSONField(
         verbose_name=_("same as format_data, but including frozen results"),
         null=True,
         blank=True,
     )
     score_final = models.FloatField(verbose_name=_("final score"), default=0)
-    cumtime_final = models.PositiveIntegerField(
+    cumtime_final = models.BigIntegerField(
         verbose_name=_("final cumulative time"), default=0
     )
 
@@ -828,17 +863,20 @@ class ContestParticipation(models.Model):
 
     def __str__(self):
         if self.spectate:
-            return gettext("%s spectating in %s") % (
-                self.user.username,
-                self.contest.name,
-            )
+            return gettext("%(username)s spectating in %(contest)s") % {
+                "username": self.user.username,
+                "contest": self.contest.name,
+            }
         if self.virtual:
-            return gettext("%s in %s, v%d") % (
-                self.user.username,
-                self.contest.name,
-                self.virtual,
-            )
-        return gettext("%s in %s") % (self.user.username, self.contest.name)
+            return gettext("%(username)s in %(contest)s, v%(virtual)d") % {
+                "username": self.user.username,
+                "contest": self.contest.name,
+                "virtual": self.virtual,
+            }
+        return gettext("%(username)s in %(contest)s") % {
+            "username": self.user.username,
+            "contest": self.contest.name,
+        }
 
     class Meta:
         verbose_name = _("contest participation")
@@ -848,8 +886,23 @@ class ContestParticipation(models.Model):
 
 
 class ContestProblem(models.Model):
+    # Made nullable to support quiz integration
     problem = models.ForeignKey(
-        Problem, verbose_name=_("problem"), related_name="contests", on_delete=CASCADE
+        Problem,
+        verbose_name=_("problem"),
+        related_name="contests",
+        on_delete=CASCADE,
+        null=True,
+        blank=True,
+    )
+    # New field for quiz support
+    quiz = models.ForeignKey(
+        "Quiz",  # String reference to avoid circular import
+        verbose_name=_("quiz"),
+        related_name="contest_quizzes",
+        on_delete=CASCADE,
+        null=True,
+        blank=True,
     )
     contest = models.ForeignKey(
         Contest,
@@ -882,13 +935,84 @@ class ContestProblem(models.Model):
         blank=True,
         max_length=20,
     )
+    is_result_hidden = models.BooleanField(
+        default=False,
+        verbose_name=_("hide results"),
+        help_text=_(
+            "Hide all results for this problem/quiz from non-editors. "
+            "Shows ? instead of scores."
+        ),
+    )
+
+    def clean(self):
+        # Ensure exactly one of problem or quiz is set
+        if not self.problem and not self.quiz:
+            raise ValidationError(_("Either problem or quiz must be set"))
+        if self.problem and self.quiz:
+            raise ValidationError(_("Cannot set both problem and quiz"))
+
+    def save(self, *args, **kwargs):
+        self.full_clean()  # Validate before saving
+        # Check if is_result_hidden changed
+        is_result_hidden_changed = False
+        if self.pk:
+            try:
+                old = ContestProblem.objects.get(pk=self.pk)
+                if old.is_result_hidden != self.is_result_hidden:
+                    is_result_hidden_changed = True
+            except ContestProblem.DoesNotExist:
+                pass
+        super().save(*args, **kwargs)
+        # Invalidate the cache when a contest problem is updated
+        get_contest_problem_points.dirty(self.contest_id)
+        get_contest_problem_ids.dirty(self.contest_id)
+        # Recompute all participations when is_result_hidden changes
+        if is_result_hidden_changed:
+            for participation in self.contest.users.filter(virtual__gte=0):
+                participation.recompute_results()
+
+    save.alters_data = True
+
+    def delete(self, *args, **kwargs):
+        contest_id = self.contest_id
+        super().delete(*args, **kwargs)
+        # Invalidate the cache when a contest problem is deleted
+        get_contest_problem_points.dirty(contest_id)
+        get_contest_problem_ids.dirty(contest_id)
+
+    delete.alters_data = True
 
     @property
     def clarifications(self):
         return ContestProblemClarification.objects.filter(problem=self)
 
+    @property
+    def display_name(self):
+        """Get display name for either problem or quiz"""
+        if self.problem:
+            return self.problem.name
+        elif self.quiz:
+            return self.quiz.title
+        return ""
+
+    @property
+    def is_quiz(self):
+        """Check if this is a quiz rather than a problem"""
+        return self.quiz is not None
+
+    def __str__(self):
+        if self.problem:
+            return f"{self.contest.name} - {self.problem.name}"
+        elif self.quiz:
+            return f"{self.contest.name} - {self.quiz.title}"
+        return f"{self.contest.name} - Unknown"
+
     class Meta:
-        unique_together = ("problem", "contest")
+        # Updated to handle both problem and quiz uniqueness
+        unique_together = [
+            ("problem", "contest"),
+            ("quiz", "contest"),
+        ]
         verbose_name = _("contest problem")
         verbose_name_plural = _("contest problems")
 
@@ -920,6 +1044,21 @@ class ContestSubmission(models.Model):
         help_text=_("Whether this submission was ran only on pretests."),
         default=False,
     )
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        # Invalidate the user count cache when a submission is added or updated
+        get_contest_problem_user_count.dirty(self.problem.contest_id)
+
+    save.alters_data = True
+
+    def delete(self, *args, **kwargs):
+        contest_id = self.problem.contest_id
+        super().delete(*args, **kwargs)
+        # Invalidate the cache when a submission is deleted
+        get_contest_problem_user_count.dirty(contest_id)
+
+    delete.alters_data = True
 
     class Meta:
         verbose_name = _("contest submission")
@@ -1059,3 +1198,103 @@ class OfficialContest(models.Model):
     class Meta:
         verbose_name = _("official contest")
         verbose_name_plural = _("official contests")
+
+
+@cache_wrapper(prefix="contest_problem_points", expected_type=dict)
+def get_contest_problem_points(contest_id):
+    return {
+        cp["problem_id"]: cp["points"]
+        for cp in ContestProblem.objects.filter(contest_id=contest_id).values(
+            "problem_id", "points"
+        )
+    }
+
+
+@cache_wrapper(prefix="contest_problem_id", expected_type=list)
+def get_contest_problem_ids(contest_id):
+    """
+    Get a list of problem IDs for a given contest.
+
+    Args:
+        contest_id: The ID of the contest
+
+    Returns:
+        A list of problem IDs associated with the contest (excludes quiz-only entries)
+    """
+    return list(
+        ContestProblem.objects.filter(contest_id=contest_id, problem_id__isnull=False)
+        .order_by("order")
+        .values_list("problem_id", flat=True)
+    )
+
+
+@cache_wrapper(prefix="contest_problem_user_count", expected_type=dict)
+def get_contest_problem_user_count(contest_id):
+    """
+    Get the number of unique users who submitted to each problem in a contest.
+
+    Args:
+        contest_id: The ID of the contest
+
+    Returns:
+        A dictionary mapping problem_id to the count of users who submitted
+    """
+    user_counts = (
+        ContestProblem.objects.filter(contest_id=contest_id)
+        .annotate(user_count=Count("submission__participation", distinct=True))
+        .values("problem_id", "user_count")
+    )
+
+    return {item["problem_id"]: item["user_count"] for item in user_counts}
+
+
+def _get_contest_organization_ids_batch(args_list):
+    """
+    Batch function to get organization IDs for multiple contests efficiently.
+
+    Args:
+        args_list: List of tuples, each containing a single contest_id
+
+    Returns:
+        List of organization ID lists, one for each contest_id in args_list
+    """
+    # Extract contest IDs from args_list
+    contest_ids = [args[0] for args in args_list]
+
+    # Direct query to the through table to avoid JOIN
+    through_model = Contest.organizations.through
+    query = through_model.objects.filter(contest_id__in=contest_ids)
+
+    # Group organization IDs by contest ID
+    contest_orgs = {}
+    for contest_id, org_id in query.values_list("contest_id", "organization_id"):
+        if contest_id not in contest_orgs:
+            contest_orgs[contest_id] = []
+        contest_orgs[contest_id].append(org_id)
+
+    # Return results in the same order as input contest_ids
+    results = []
+    for contest_id in contest_ids:
+        results.append(contest_orgs.get(contest_id, []))
+
+    return results
+
+
+@cache_wrapper(
+    prefix="Cgoi", expected_type=list, batch_fn=_get_contest_organization_ids_batch
+)
+def _get_contest_organization_ids(contest_id):
+    """Get organization IDs for a contest"""
+    results = _get_contest_organization_ids_batch([(contest_id,)])
+    return results[0]
+
+
+@cache_wrapper(prefix="RTG_range", expected_type=dict, timeout=86400)
+def get_global_rating_range():
+    """
+    Get the global minimum and maximum rating values.
+
+    Returns:
+        A dictionary with keys 'rating__min' and 'rating__max'.
+    """
+    return Rating.objects.aggregate(Min("rating"), Max("rating"))

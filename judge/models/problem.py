@@ -1,30 +1,29 @@
 import errno
-from operator import attrgetter
+import os
 
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericRelation
 from django.core.cache import cache
+from django.core.files.storage import default_storage
 from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
 from django.db import models
-from django.db.models import CASCADE, F, FilteredRelation, Q, SET_NULL, Exists, OuterRef
-from django.db.models.functions import Coalesce
+from django.db.models import CASCADE, Q, SET_NULL, Exists, OuterRef
 from django.urls import reverse
 from django.utils.functional import cached_property
+from django.utils.timezone import now
 from django.utils.translation import gettext_lazy as _
-from django.db.models.signals import m2m_changed
-from django.dispatch import receiver
 
-from judge.fulltext import SearchQuerySet
+from judge.fulltext import SearchManager
 from judge.models.pagevote import PageVotable
 from judge.models.bookmark import Bookmarkable
 from judge.models.profile import Organization, Profile
 from judge.models.runtime import Language
-from judge.user_translations import gettext as user_gettext
 from judge.models.problem_data import (
     problem_data_storage,
     problem_directory_file_helper,
 )
-from judge.caching import cache_wrapper
+from judge.caching import cache_wrapper, CacheableModel
+from judge.utils.files import generate_secure_filename
 
 __all__ = [
     "ProblemGroup",
@@ -33,12 +32,17 @@ __all__ = [
     "ProblemTranslation",
     "License",
     "Solution",
-    "TranslatedProblemQuerySet",
 ]
 
 
 def problem_directory_file(data, filename):
     return problem_directory_file_helper(data.code, filename)
+
+
+def problem_pdf_upload_path(problem, filename):
+    """Upload path for problem PDF descriptions using default storage (S3 compatible)."""
+    secure_filename = generate_secure_filename(filename, problem.code)
+    return f"problem_pdfs/{problem.code}/{secure_filename}"
 
 
 class ProblemType(models.Model):
@@ -51,6 +55,16 @@ class ProblemType(models.Model):
 
     def __str__(self):
         return self.full_name
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        problem_ids = Problem.types.through.objects.filter(
+            problemtype_id=self.id
+        ).values_list("problem_id", flat=True)
+        if problem_ids:
+            _get_problem_types_name.dirty_multi([(id,) for id in problem_ids])
+
+    save.alters_data = True
 
     class Meta:
         ordering = ["full_name"]
@@ -66,6 +80,14 @@ class ProblemGroup(models.Model):
 
     def __str__(self):
         return self.full_name
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        problem_ids = Problem.objects.filter(group=self).values_list("id", flat=True)
+        if problem_ids:
+            Problem.dirty_cache(*problem_ids)
+
+    save.alters_data = True
 
     class Meta:
         ordering = ["full_name"]
@@ -107,26 +129,9 @@ class License(models.Model):
         verbose_name_plural = _("licenses")
 
 
-class TranslatedProblemQuerySet(SearchQuerySet):
-    def __init__(self, **kwargs):
-        super(TranslatedProblemQuerySet, self).__init__(("code", "name"), **kwargs)
-
-    def add_i18n_name(self, language):
-        return self.annotate(
-            i18n_translation=FilteredRelation(
-                "translations",
-                condition=Q(translations__language=language),
-            )
-        ).annotate(
-            i18n_name=Coalesce(
-                F("i18n_translation__name"), F("name"), output_field=models.CharField()
-            )
-        )
-
-
-class Problem(models.Model, PageVotable, Bookmarkable):
+class Problem(CacheableModel, PageVotable, Bookmarkable):
     code = models.CharField(
-        max_length=20,
+        max_length=30,
         verbose_name=_("problem code"),
         unique=True,
         validators=[
@@ -137,7 +142,7 @@ class Problem(models.Model, PageVotable, Bookmarkable):
         ),
     )
     name = models.CharField(
-        max_length=100,
+        max_length=150,
         verbose_name=_("problem name"),
         db_index=True,
         help_text=_("The full name of the problem, " "as shown in the problem list."),
@@ -180,6 +185,8 @@ class Problem(models.Model, PageVotable, Bookmarkable):
         ProblemGroup,
         verbose_name=_("problem group"),
         on_delete=CASCADE,
+        null=True,
+        blank=True,
         help_text=_("The group of problem, shown under Category in the problem list."),
     )
     time_limit = models.FloatField(
@@ -204,7 +211,14 @@ class Problem(models.Model, PageVotable, Bookmarkable):
             MaxValueValidator(settings.DMOJ_PROBLEM_MAX_MEMORY_LIMIT),
         ],
     )
-    short_circuit = models.BooleanField(default=False)
+    short_circuit = models.BooleanField(
+        default=False,
+        verbose_name=_("stop on first fail"),
+        help_text=_(
+            "Stop judging when the first test case fails (ICPC-style). "
+            "If disabled, all test cases will be judged."
+        ),
+    )
     points = models.FloatField(
         verbose_name=_("points"),
         help_text=_(
@@ -241,7 +255,7 @@ class Problem(models.Model, PageVotable, Bookmarkable):
     )
     banned_users = models.ManyToManyField(
         Profile,
-        verbose_name=_("personae non gratae"),
+        verbose_name=_("Banned users"),
         blank=True,
         help_text=_("Bans the selected users from submitting to this problem."),
     )
@@ -269,11 +283,11 @@ class Problem(models.Model, PageVotable, Bookmarkable):
     )
     ac_rate = models.FloatField(verbose_name=_("solve rate"), default=0)
 
-    objects = TranslatedProblemQuerySet.as_manager()
     tickets = GenericRelation("Ticket")
     comments = GenericRelation("Comment")
     pagevote = GenericRelation("PageVote")
     bookmark = GenericRelation("BookMark")
+    objects = SearchManager(("code", "name"))
 
     organizations = models.ManyToManyField(
         Organization,
@@ -286,28 +300,20 @@ class Problem(models.Model, PageVotable, Bookmarkable):
     )
     pdf_description = models.FileField(
         verbose_name=_("pdf statement"),
-        storage=problem_data_storage,
         null=True,
         blank=True,
-        upload_to=problem_directory_file,
+        upload_to=problem_pdf_upload_path,
     )
 
     def __init__(self, *args, **kwargs):
         super(Problem, self).__init__(*args, **kwargs)
-        self._translated_name_cache = {}
-        self._i18n_name = None
         self.__original_code = self.code
 
-    @cached_property
-    def types_list(self):
-        return list(map(user_gettext, map(attrgetter("full_name"), self.types.all())))
-
     def languages_list(self):
-        return (
-            self.allowed_languages.values_list("common_name", flat=True)
-            .distinct()
-            .order_by("common_name")
+        common_names = set(
+            [item["common_name"] for item in _get_allowed_languages(self.id)]
         )
+        return sorted(common_names)
 
     def is_editor(self, profile):
         return (
@@ -317,23 +323,15 @@ class Problem(models.Model, PageVotable, Bookmarkable):
     def is_editable_by(self, user):
         if not user.is_authenticated:
             return False
-        if (
-            user.has_perm("judge.edit_all_problem")
-            or user.has_perm("judge.edit_public_problem")
-            and self.is_public
-        ):
+        if user.is_superuser:
             return True
-        return user.has_perm("judge.edit_own_problem") and self.is_editor(user.profile)
+        return self.is_editor(user.profile)
 
-    def is_accessible_by(self, user, in_contest_mode=True):
+    def is_accessible_by(self, user, in_contest=True):
         # Problem is public.
         if self.is_public:
             # Problem is not private to an organization.
             if not self.is_organization_private:
-                return True
-
-            # If the user can see all organization private problems.
-            if user.has_perm("judge.see_organization_problem"):
                 return True
 
             # If the user is in the organization.
@@ -342,15 +340,14 @@ class Problem(models.Model, PageVotable, Bookmarkable):
             ):
                 return True
 
-        # If the user can view all problems.
-        if user.has_perm("judge.see_private_problem"):
-            return True
-
         if not user.is_authenticated:
             return False
 
+        if user.is_superuser:
+            return True
+
         # If the user authored the problem or is a curator.
-        if user.has_perm("judge.edit_own_problem") and self.is_editor(user.profile):
+        if self.is_editor(user.profile):
             return True
 
         # If user is a tester.
@@ -359,20 +356,17 @@ class Problem(models.Model, PageVotable, Bookmarkable):
 
         # If user is currently in a contest containing that problem.
         current = user.profile.current_contest_id
-        if not in_contest_mode or current is None:
+        if not in_contest or current is None:
             return False
-        from judge.models import ContestProblem
+
+        from judge.models.contest import ContestProblem
 
         return ContestProblem.objects.filter(
             problem_id=self.id, contest__users__id=current
         ).exists()
 
     def is_subs_manageable_by(self, user):
-        return (
-            user.is_staff
-            and user.has_perm("judge.rejudge_submission")
-            and self.is_editable_by(user)
-        )
+        return self.is_editable_by(user)
 
     @classmethod
     def get_visible_problems(cls, user, profile=None):
@@ -432,31 +426,42 @@ class Problem(models.Model, PageVotable, Bookmarkable):
         return "%s (%s)" % (self.name, self.code)
 
     def get_absolute_url(self):
-        return reverse("problem_detail", args=(self.code,))
+        return reverse("problem_detail", args=(self.get_code(),))
 
-    @cached_property
-    def author_ids(self):
-        return Problem.authors.through.objects.filter(problem=self).values_list(
-            "profile_id", flat=True
+    @cache_wrapper(prefix="Pgai", expected_type=list)
+    def get_author_ids(self):
+        return list(
+            Problem.authors.through.objects.filter(problem=self.id).values_list(
+                "profile_id", flat=True
+            )
         )
 
-    @cache_wrapper(prefix="Pga", expected_type=models.query.QuerySet)
-    def get_authors(self):
-        return self.authors.only("id")
-
-    @cached_property
-    def editor_ids(self):
-        return self.author_ids.union(
+    @cache_wrapper(prefix="Pgci", expected_type=list)
+    def get_curator_ids(self):
+        return list(
             Problem.curators.through.objects.filter(problem=self).values_list(
                 "profile_id", flat=True
             )
         )
 
+    @cache_wrapper(prefix="Pgti", expected_type=list)
+    def get_tester_ids(self):
+        return list(
+            Problem.testers.through.objects.filter(problem=self).values_list(
+                "profile_id", flat=True
+            )
+        )
+
+    def get_authors(self):
+        return Profile.get_cached_instances(*self.get_author_ids())
+
+    @cached_property
+    def editor_ids(self):
+        return list(set(self.get_author_ids() + self.get_curator_ids()))
+
     @cached_property
     def tester_ids(self):
-        return Problem.testers.through.objects.filter(problem=self).values_list(
-            "profile_id", flat=True
-        )
+        return self.get_tester_ids()
 
     @cached_property
     def usable_common_names(self):
@@ -469,27 +474,120 @@ class Problem(models.Model, PageVotable, Bookmarkable):
         ).distinct()
 
     def translated_name(self, language):
-        if language in self._translated_name_cache:
-            return self._translated_name_cache[language]
-        # Hits database despite prefetch_related.
-        try:
-            name = self.translations.filter(language=language).values_list(
-                "name", flat=True
-            )[0]
-        except IndexError:
-            name = self.name
-        self._translated_name_cache[language] = name
-        return name
+        translation = _get_problem_i18n_name(self.id, language)
+        if not translation:
+            return self.get_name()
+        return translation
 
-    @property
-    def i18n_name(self):
-        if self._i18n_name is None:
-            self._i18n_name = self._trans[0].name if self._trans else self.name
-        return self._i18n_name
+    @classmethod
+    def get_cached_dict(cls, problem_id):
+        return _get_problem(problem_id)
 
-    @i18n_name.setter
-    def i18n_name(self, value):
-        self._i18n_name = value
+    @classmethod
+    def get_cached_instances(cls, *ids):
+        # Prefetch cache data and filter out deleted problems
+        cached_results = _get_problem.batch([(id,) for id in ids])
+        return [
+            cls(id=id) for id, result in zip(ids, cached_results) if result is not None
+        ]
+
+    @classmethod
+    def prefetch_cache_i18n_name(cls, lang, *ids):
+        _get_problem_i18n_name.batch([(id, lang) for id in ids])
+
+    @classmethod
+    def prefetch_cache_types_name(cls, *ids):
+        _get_problem_types_name.batch([(id,) for id in ids])
+
+    @classmethod
+    def prefetch_cache_description(cls, lang, *ids):
+        if lang:
+            _get_problem_i18n_description.batch([(id, lang) for id in ids])
+        else:
+            _get_problem_description.batch([(id,) for id in ids])
+
+    @classmethod
+    def prefetch_cache_has_public_editorial(cls, *ids):
+        _get_problem_has_public_editorial.batch([(id,) for id in ids])
+
+    @classmethod
+    def dirty_cache(cls, *ids):
+        _get_problem.dirty_multi([(id,) for id in ids])
+        _get_problem_description.dirty_multi([(id,) for id in ids])
+
+    def get_code(self):
+        return self.get_cached_value("code")
+
+    def get_name(self):
+        return self.get_cached_value("name")
+
+    def get_time_limit(self):
+        return self.get_cached_value("time_limit")
+
+    def get_memory_limit(self):
+        return self.get_cached_value("memory_limit")
+
+    def get_points(self):
+        return self.get_cached_value("points")
+
+    def get_ac_rate(self):
+        return self.get_cached_value("ac_rate")
+
+    def get_user_count(self):
+        return self.get_cached_value("user_count")
+
+    def get_is_public(self):
+        return self.get_cached_value("is_public")
+
+    def get_group_name(self):
+        return self.get_cached_value("group_name") or ""
+
+    def get_partial(self):
+        return self.get_cached_value("partial")
+
+    def get_description(self):
+        return _get_problem_description(self.id)
+
+    def get_pdf_description(self):
+        return self.get_cached_value("pdf_description")
+
+    def translated_description(self, language):
+        translation = _get_problem_i18n_description(self.id, language)
+        if not translation:
+            return self.get_description()
+        return translation
+
+    def get_types_name(self):
+        return _get_problem_types_name(self.id)
+
+    def has_public_editorial(self):
+        return _get_problem_has_public_editorial(self.id)
+
+    def get_allowed_languages(self):
+        return [item["id"] for item in _get_allowed_languages(self.id)]
+
+    def get_organization_ids(self):
+        return _get_problem_organization_ids(self.id)
+
+    @classmethod
+    def prefetch_organization_ids(cls, *problem_ids):
+        _get_problem_organization_ids.batch([(id,) for id in problem_ids])
+
+    def get_organizations(self):
+        organization_ids = self.get_organization_ids()
+        return Organization.get_cached_instances(*organization_ids)
+
+    def get_contest_points(self, contest_id):
+        from judge.models.contest import get_contest_problem_points
+
+        points_dict = get_contest_problem_points(contest_id)
+        return points_dict.get(self.id)
+
+    def get_contest_user_count(self, contest_id):
+        from judge.models.contest import get_contest_problem_user_count
+
+        user_counts = get_contest_problem_user_count(contest_id)
+        return user_counts.get(self.id, 0)
 
     def update_stats(self):
         self.user_count = (
@@ -515,6 +613,7 @@ class Problem(models.Model, PageVotable, Bookmarkable):
 
     update_stats.alters_data = True
 
+    @cache_wrapper(prefix="Pgl", expected_type=list)
     def _get_limits(self, key):
         global_limit = getattr(self, key)
         limits = {
@@ -543,23 +642,11 @@ class Problem(models.Model, PageVotable, Bookmarkable):
 
     @property
     def language_time_limit(self):
-        key = "problem_tls:%d" % self.id
-        result = cache.get(key)
-        if result is not None:
-            return result
-        result = self._get_limits("time_limit")
-        cache.set(key, result)
-        return result
+        return self._get_limits("time_limit")
 
     @property
     def language_memory_limit(self):
-        key = "problem_mls:%d" % self.id
-        result = cache.get(key)
-        if result is not None:
-            return result
-        result = self._get_limits("memory_limit")
-        cache.set(key, result)
-        return result
+        return self._get_limits("memory_limit")
 
     def handle_code_change(self):
         has_data = hasattr(self, "data_files")
@@ -567,32 +654,84 @@ class Problem(models.Model, PageVotable, Bookmarkable):
         if not has_data and not has_pdf:
             return
 
-        try:
-            problem_data_storage.rename(self.__original_code, self.code)
-        except OSError as e:
-            if e.errno != errno.ENOENT:
-                raise
-
-        if has_pdf:
-            self.pdf_description.name = problem_directory_file_helper(
-                self.code, self.pdf_description.name
-            )
-            super().save(update_fields=["pdf_description"])
-
+        # Handle test data storage rename (stays local)
         if has_data:
+            try:
+                problem_data_storage.rename(self.__original_code, self.code)
+            except OSError as e:
+                if e.errno != errno.ENOENT:
+                    raise
             self.data_files._update_code(self.__original_code, self.code)
+
+        # Handle PDF description move using default_storage (S3 compatible)
+        if has_pdf:
+            old_path = self.pdf_description.name
+            filename = os.path.basename(old_path)
+            new_path = f"problem_pdfs/{self.code}/{filename}"
+
+            # Copy file to new location and delete old one
+            if default_storage.exists(old_path):
+                from django.core.files.base import ContentFile
+
+                with default_storage.open(old_path, "rb") as f:
+                    default_storage.save(new_path, ContentFile(f.read()))
+                default_storage.delete(old_path)
+
+            self.pdf_description.name = new_path
+            super().save(update_fields=["pdf_description"])
 
     def save(self, should_move_data=True, *args, **kwargs):
         code_changed = self.__original_code and self.code != self.__original_code
+        # Cap points to 1 for non-public problems to prevent abuse
+        # Superusers can bypass this by setting _bypass_points_cap=True on the instance
+        bypass_points_cap = getattr(self, "_bypass_points_cap", False)
+        if not bypass_points_cap and (
+            not self.is_public or self.is_organization_private
+        ):
+            self.points = min(self.points, 1)
         super(Problem, self).save(*args, **kwargs)
         if code_changed and should_move_data:
             self.handle_code_change()
+            self._notify_judges_update()
+
+        if not hasattr(self, "_updating_stats_only"):
+            self._invalidate_pdf_cache()
+
+    def _invalidate_pdf_cache(self):
+        cache.delete_many(
+            [
+                "generated-meta-problem:%s:%d" % (lang, self.id)
+                for lang, _ in settings.LANGUAGES
+            ]
+        )
+
+        for lang, _ in settings.LANGUAGES:
+            pdf_path = os.path.join(
+                settings.DMOJ_PDF_PROBLEM_CACHE, "%s.%s.pdf" % (self.code, lang)
+            )
+            try:
+                os.unlink(pdf_path)
+            except OSError as e:
+                if e.errno != errno.ENOENT:
+                    raise
 
     def delete(self, *args, **kwargs):
         super().delete(*args, **kwargs)
         problem_data_storage.delete_directory(self.code)
+        self._notify_judges_update()
+
+    def _notify_judges_update(self):
+        if not getattr(settings, "DMOJ_PROBLEM_DATA_PUSH_UPDATE", False):
+            return
+        from judge.judgeapi import notify_problem_update
+
+        try:
+            notify_problem_update()
+        except Exception:
+            pass
 
     save.alters_data = True
+    delete.alters_data = True
 
     class Meta:
         permissions = (
@@ -625,6 +764,18 @@ class ProblemTranslation(models.Model):
     )
     description = models.TextField(verbose_name=_("translated description"))
 
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        _get_problem_i18n_name.dirty(self.problem_id, self.language)
+        _get_problem_i18n_description.dirty(self.problem_id, self.language)
+
+    def delete(self, *args, **kwargs):
+        super().delete(*args, **kwargs)
+        _get_problem_i18n_name.dirty(self.problem_id, self.language)
+        _get_problem_i18n_description.dirty(self.problem_id, self.language)
+
+    save.alters_data = True
+
     class Meta:
         unique_together = ("problem", "language")
         verbose_name = _("problem translation")
@@ -655,6 +806,19 @@ class LanguageLimit(models.Model):
             MaxValueValidator(settings.DMOJ_PROBLEM_MAX_MEMORY_LIMIT),
         ],
     )
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        # Invalidate language limit cache after saving
+        Problem._get_limits.dirty(self.problem, "time_limit")
+        Problem._get_limits.dirty(self.problem, "memory_limit")
+
+    def delete(self, *args, **kwargs):
+        problem = self.problem  # Store reference before deletion
+        super().delete(*args, **kwargs)
+        # Invalidate language limit cache after deletion
+        Problem._get_limits.dirty(problem, "time_limit")
+        Problem._get_limits.dirty(problem, "memory_limit")
 
     class Meta:
         unique_together = ("problem", "language")
@@ -697,6 +861,22 @@ class Solution(models.Model, PageVotable, Bookmarkable):
     pagevote = GenericRelation("PageVote")
     bookmark = GenericRelation("BookMark")
 
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if self.problem:
+            # Invalidate the has_public_editorial cache
+            _get_problem_has_public_editorial.dirty(self.problem_id)
+
+    save.alters_data = True
+
+    @cache_wrapper(prefix="Sgai", expected_type=list)
+    def get_author_ids(self):
+        return list(
+            Solution.authors.through.objects.filter(solution=self.id).values_list(
+                "profile_id", flat=True
+            )
+        )
+
     def get_absolute_url(self):
         problem = self.problem
         if problem is None:
@@ -710,6 +890,13 @@ class Solution(models.Model, PageVotable, Bookmarkable):
 
     def __str__(self):
         return _("Editorial for %s") % self.problem.name
+
+    def is_accessible_by(self, user):
+        if self.is_public and self.publish_on <= now():
+            return True
+        if user.has_perm("judge.see_private_solution"):
+            return True
+        return False
 
     class Meta:
         permissions = (("see_private_solution", "See hidden solutions"),)
@@ -747,8 +934,352 @@ class ProblemPointsVote(models.Model):
         return f"{self.voter}: {self.points} for {self.problem.code}"
 
 
-@receiver(m2m_changed, sender=Problem.organizations.through)
-def update_organization_private(sender, instance, **kwargs):
-    if kwargs["action"] in ["post_add", "post_remove", "post_clear"]:
-        instance.is_organization_private = instance.organizations.exists()
-        instance.save(update_fields=["is_organization_private"])
+def _get_problem_batch(args_list):
+    """
+    Batch function to get problem data for multiple problems at once.
+
+    Args:
+        args_list: List of tuples, where each tuple contains a problem_id
+
+    Returns:
+        List of problem data dictionaries
+    """
+    # Extract problem IDs from args_list
+    problem_ids = [args[0] for args in args_list]
+
+    # Fetch all problems in a single query with appropriate related data using values
+    problems = (
+        Problem.objects.filter(id__in=problem_ids)
+        .select_related("group")
+        .values(
+            "id",
+            "code",
+            "name",
+            "time_limit",
+            "memory_limit",
+            "points",
+            "partial",
+            "is_public",
+            "is_organization_private",
+            "group_id",
+            "group__full_name",
+            "user_count",
+            "ac_rate",
+            "pdf_description",
+        )
+    )
+
+    # Create a dictionary mapping problem_id to problem data
+    problem_dict = {}
+    for problem in problems:
+        problem_id = problem["id"]
+        problem_dict[problem_id] = {
+            "code": problem["code"],
+            "name": problem["name"],
+            "time_limit": problem["time_limit"],
+            "memory_limit": problem["memory_limit"],
+            "points": problem["points"],
+            "partial": problem["partial"],
+            "is_public": problem["is_public"],
+            "is_organization_private": problem["is_organization_private"],
+            "group_id": problem["group_id"],
+            "group_name": problem["group__full_name"],
+            "user_count": problem["user_count"],
+            "ac_rate": problem["ac_rate"],
+            "pdf_description": problem["pdf_description"],
+        }
+        # Remove None values to save cache space
+        problem_dict[problem_id] = {
+            k: v for k, v in problem_dict[problem_id].items() if v is not None
+        }
+
+    # Build result list in the same order as the input problem_ids
+    results = []
+    for problem_id in problem_ids:
+        if problem_id in problem_dict:
+            results.append(problem_dict[problem_id])
+        else:
+            # Problem was deleted, return None (filtered out by get_cached_instances)
+            results.append(None)
+
+    return results
+
+
+@cache_wrapper(prefix="Prgp3", expected_type=dict, batch_fn=_get_problem_batch)
+def _get_problem(problem_id):
+    results = _get_problem_batch([(problem_id,)])
+    return results[0]
+
+
+def _get_problem_description_batch(args_list):
+    """
+    Batch function to get problem descriptions for multiple problems at once.
+
+    Args:
+        args_list: List of tuples, where each tuple contains a problem_id
+
+    Returns:
+        List of problem descriptions
+    """
+    problem_ids = [args[0] for args in args_list]
+
+    descriptions = Problem.objects.filter(id__in=problem_ids).values(
+        "id", "description"
+    )
+    description_dict = {item["id"]: item["description"] for item in descriptions}
+
+    results = []
+    for problem_id in problem_ids:
+        if problem_id in description_dict:
+            results.append(description_dict[problem_id])
+        else:
+            results.append(None)
+
+    return results
+
+
+@cache_wrapper(prefix="Prdesc", batch_fn=_get_problem_description_batch)
+def _get_problem_description(problem_id):
+    results = _get_problem_description_batch([(problem_id,)])
+    return results[0]
+
+
+def _get_problem_i18n_name_batch(args_list):
+    """
+    Batch function to get translated problem names for multiple problems in a specific language.
+
+    Args:
+        args_list: List of tuples, where each tuple contains (problem_id, language)
+
+    Returns:
+        List of translated problem names
+    """
+    problems_by_lang = {}
+    for problem_id, language in args_list:
+        if language not in problems_by_lang:
+            problems_by_lang[language] = []
+        problems_by_lang[language].append(problem_id)
+
+    results_dict = {}
+
+    for language, problem_ids in problems_by_lang.items():
+        translations = ProblemTranslation.objects.filter(
+            problem_id__in=problem_ids, language=language
+        ).values("problem_id", "name")
+
+        problem_id_to_name = {}
+
+        for trans in translations:
+            problem_id_to_name[trans["problem_id"]] = trans["name"]
+
+        for problem_id in problem_ids:
+            results_dict[(problem_id, language)] = problem_id_to_name.get(problem_id)
+
+    results = []
+    for problem_id, language in args_list:
+        results.append(results_dict.get((problem_id, language), None))
+
+    return results
+
+
+@cache_wrapper(prefix="Pri18n2", batch_fn=_get_problem_i18n_name_batch)
+def _get_problem_i18n_name(problem_id, language):
+    results = _get_problem_i18n_name_batch([(problem_id, language)])
+    return results[0]
+
+
+def _get_problem_i18n_description_batch(args_list):
+    """
+    Batch function to get translated problem descriptions for multiple problems in a specific language.
+
+    Args:
+        args_list: List of tuples, where each tuple contains (problem_id, language)
+
+    Returns:
+        List of translated problem descriptions
+    """
+    problems_by_lang = {}
+    for problem_id, language in args_list:
+        if language not in problems_by_lang:
+            problems_by_lang[language] = []
+        problems_by_lang[language].append(problem_id)
+
+    results_dict = {}
+
+    for language, problem_ids in problems_by_lang.items():
+        problem_descriptions = {}
+        translations = ProblemTranslation.objects.filter(
+            problem_id__in=problem_ids, language=language
+        ).values("problem_id", "description")
+
+        for trans in translations:
+            problem_descriptions[trans["problem_id"]] = trans["description"]
+
+        for problem_id in problem_ids:
+            if problem_id in problem_descriptions:
+                results_dict[(problem_id, language)] = problem_descriptions[problem_id]
+
+    results = []
+    for problem_id, language in args_list:
+        results.append(results_dict.get((problem_id, language), None))
+
+    return results
+
+
+@cache_wrapper(
+    prefix="Pri18ndesc2",
+    batch_fn=_get_problem_i18n_description_batch,
+)
+def _get_problem_i18n_description(problem_id, language):
+    results = _get_problem_i18n_description_batch([(problem_id, language)])
+    return results[0]
+
+
+def _get_problem_types_name_batch(args_list):
+    """
+    Batch function to get problem types' full names for multiple problems at once.
+
+    Args:
+        args_list: List of tuples, where each tuple contains a problem_id
+
+    Returns:
+        List of lists, each containing the full names of the problem types
+    """
+    problem_ids = [args[0] for args in args_list]
+    problem_types = {}
+
+    # Fetch problem type relationships for all problems in one query
+    problem_type_relations = Problem.types.through.objects.filter(
+        problem_id__in=problem_ids
+    ).values("problem_id", "problemtype_id")
+
+    # Get all unique type IDs
+    type_ids = set(rel["problemtype_id"] for rel in problem_type_relations)
+
+    # Fetch all type information in one query
+    types_info = {
+        t["id"]: t["full_name"]
+        for t in ProblemType.objects.filter(id__in=type_ids).values("id", "full_name")
+    }
+
+    # Group types by problem
+    for relation in problem_type_relations:
+        problem_id = relation["problem_id"]
+        type_id = relation["problemtype_id"]
+
+        if problem_id not in problem_types:
+            problem_types[problem_id] = []
+
+        if type_id in types_info:
+            problem_types[problem_id].append(types_info[type_id])
+
+    # Build result list in the same order as the input problem_ids
+    results = []
+    for problem_id in problem_ids:
+        results.append(problem_types.get(problem_id, []))
+
+    return results
+
+
+@cache_wrapper(
+    prefix="Prtn", expected_type=list, batch_fn=_get_problem_types_name_batch
+)
+def _get_problem_types_name(problem_id):
+    results = _get_problem_types_name_batch([(problem_id,)])
+    return results[0]
+
+
+def _get_problem_has_public_editorial_batch(args_list):
+    """
+    Batch function to check if problems have public editorials.
+
+    Args:
+        args_list: List of tuples, where each tuple contains a problem_id
+
+    Returns:
+        List of booleans indicating whether each problem has a public editorial
+    """
+    # Extract problem IDs from args_list
+    problem_ids = [args[0] for args in args_list]
+
+    # Get all problem IDs that have public editorials
+    problem_ids_with_editorial = set(
+        Solution.objects.filter(
+            problem_id__in=problem_ids, is_public=True, publish_on__lte=now()
+        ).values_list("problem_id", flat=True)
+    )
+
+    # Build result list in the same order as the input problem_ids
+    results = []
+    for problem_id in problem_ids:
+        results.append(problem_id in problem_ids_with_editorial)
+    return results
+
+
+@cache_wrapper(prefix="Prhe", batch_fn=_get_problem_has_public_editorial_batch)
+def _get_problem_has_public_editorial(problem_id):
+    results = _get_problem_has_public_editorial_batch([(problem_id,)])
+    return results[0]
+
+
+@cache_wrapper(prefix="problem_distinct_points", timeout=1800, expected_type=list)
+def get_distinct_problem_points():
+    return sorted(Problem.objects.values_list("points", flat=True).distinct())
+
+
+@cache_wrapper(prefix="problem_types", timeout=1800, expected_type=list)
+def get_all_problem_types():
+    return list(ProblemType.objects.values("id", "full_name"))
+
+
+@cache_wrapper(prefix="problem_groups", timeout=1800, expected_type=list)
+def get_all_problem_groups():
+    return list(ProblemGroup.objects.values("id", "full_name"))
+
+
+@cache_wrapper(prefix="Pgaln", expected_type=list)
+def _get_allowed_languages(problem_id):
+    return list(
+        Problem.objects.get(id=problem_id).allowed_languages.values("id", "common_name")
+    )
+
+
+def _get_problem_organization_ids_batch(args_list):
+    """
+    Batch function to get organization IDs for multiple problems efficiently.
+
+    Args:
+        args_list: List of tuples, each containing a single problem_id
+
+    Returns:
+        List of organization ID lists, one for each problem_id in args_list
+    """
+    # Extract problem IDs from args_list
+    problem_ids = [args[0] for args in args_list]
+
+    # Direct query to the through table to avoid JOIN
+    through_model = Problem.organizations.through
+    query = through_model.objects.filter(problem_id__in=problem_ids)
+
+    # Group organization IDs by problem ID
+    problem_orgs = {}
+    for problem_id, org_id in query.values_list("problem_id", "organization_id"):
+        if problem_id not in problem_orgs:
+            problem_orgs[problem_id] = []
+        problem_orgs[problem_id].append(org_id)
+
+    # Return results in the same order as input problem_ids
+    results = []
+    for problem_id in problem_ids:
+        results.append(problem_orgs.get(problem_id, []))
+
+    return results
+
+
+@cache_wrapper(
+    prefix="Prgoi", expected_type=list, batch_fn=_get_problem_organization_ids_batch
+)
+def _get_problem_organization_ids(problem_id):
+    """Get organization IDs for a problem"""
+    results = _get_problem_organization_ids_batch([(problem_id,)])
+    return results[0]

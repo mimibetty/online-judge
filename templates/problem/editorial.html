@@ -11,8 +11,8 @@
 
 {% block header %}
   <div style="float:right">
-    {% if perms.judge.change_problem %}
-      [<a href="{{ url('admin:judge_problem_change', problem.id) }}">{{ _('Edit') }}</a>]
+    {% if can_edit_problem %}
+      [<a href="{{ url('problem_edit_solutions', problem.code) }}">{{ _('Edit') }}</a>]
     {% endif %}
   </div>
 {% endblock %}
@@ -31,8 +31,6 @@
       {{ solution.content|markdown(lazy_load=True)|reference|str|safe }}
     {% endcache %}
   </div>
-  <hr>
   {% include "actionbar/list.html" %}
-  <br>
   {% include "comments/list.html" %}
 {% endblock %}

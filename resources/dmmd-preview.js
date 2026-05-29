@@ -36,7 +36,7 @@ $(function () {
         var last_event = null;
         var last_text = $textarea.val();
         if (timeout) {
-            $textarea.on('keyup paste', function () {
+            $textarea.on('input', function () {
                 var text = $textarea.val();
                 if (last_text == text) return;
                 last_text = text;
@@ -57,7 +57,8 @@ $(function () {
     });
 
     if ('django' in window && 'jQuery' in window.django)
-        django.jQuery(document).on('formset:added', function(event, $row) {
+        django.jQuery(document).on('formset:added', function(event) {
+            var $row = $(event.target);
             var $preview = $row.find('.dmmd-preview');
             if ($preview.length) {
                 var id = $row.attr('id');

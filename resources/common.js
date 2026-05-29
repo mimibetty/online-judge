@@ -29,26 +29,22 @@ if (!String.prototype.endsWith) {
 }
 
 
-function register_toggle(link) {
-    link.click(function () {
-        var toggled = link.next('.toggled');
+function register_all_toggles() {
+    if (window._toggleInitialized) return;
+    window._toggleInitialized = true;
+
+    $(document).on('click', '.toggle', function() {
+        var $link = $(this);
+        var toggled = $link.next('.toggled');
         if (toggled.is(':visible')) {
             toggled.hide(400);
-            link.removeClass('open');
-            link.addClass('closed');
+            $link.removeClass('open').addClass('closed');
         } else {
             toggled.show(400);
-            link.addClass('open');
-            link.removeClass('closed');
+            $link.addClass('open').removeClass('closed');
         }
     });
 }
-
-function register_all_toggles() {
-    $('.toggle').each(function () {
-        register_toggle($(this));
-    });
-};
 
 function featureTest(property, value, noPrefixes) {
     var prop = property + ':',
@@ -62,24 +58,6 @@ function featureTest(property, value, noPrefixes) {
     }
     return !!mStyle[property];
 }
-
-window.fix_div = function (div, height) {
-    var div_offset = div.offset().top - $('html').offset().top;
-    var is_moving;
-    var moving = function () {
-        div.css('position', 'absolute').css('top', div_offset);
-        is_moving = true;
-    };
-    var fix = function () {
-        div.css('position', 'fixed').css('top', height);
-        is_moving = false;
-    };
-    ($(window).scrollTop() - div_offset > -height) ? fix() : moving();
-    $(window).scroll(function () {
-        if (($(window).scrollTop() - div_offset > -height) == is_moving)
-            is_moving ? fix() : moving();
-    });
-};
 
 if (!Date.now) {
     Date.now = function () {
@@ -252,6 +230,23 @@ $.fn.textWidth = function () {
 };
 
 function registerPopper($trigger, $dropdown) {
+    // Guard: check if elements exist
+    if (!$trigger || !$trigger.length || !$dropdown || !$dropdown.length) {
+        return;
+    }
+
+    // Guard: check if Popper is available
+    if (typeof Popper === 'undefined') {
+        console.warn('Popper.js not loaded, dropdown will not work');
+        return;
+    }
+
+    // Prevent double initialization
+    if ($trigger.data('popper-initialized')) {
+        return;
+    }
+    $trigger.data('popper-initialized', true);
+
     const popper = Popper.createPopper($trigger[0], $dropdown[0], {
         placement: 'bottom-end',
         modifiers: [
@@ -263,94 +258,271 @@ function registerPopper($trigger, $dropdown) {
             },
         ],
     });
-    $trigger.click(function(e) {
+
+    $trigger.on('click.popper', function(e) {
+        e.stopPropagation();
         $dropdown.toggle();
         popper.update();
     });
+
     $dropdown.css("min-width", $trigger.width() + 'px');
-    
-    $(document).on("click touchend", function(e) {
-        var target = $(e.target);
-        if (target.closest($trigger).length === 0 && target.closest($dropdown).length === 0) {
-            $dropdown.hide();
-        }
-    })
+
+    // Use namespaced event to prevent duplicate handlers
+    var dropdownId = $dropdown.attr('id') || Math.random().toString(36).substr(2, 9);
+    $(document).off('click.popper-' + dropdownId + ' touchend.popper-' + dropdownId)
+        .on('click.popper-' + dropdownId + ' touchend.popper-' + dropdownId, function(e) {
+            var target = $(e.target);
+            if (target.closest($trigger).length === 0 && target.closest($dropdown).length === 0) {
+                $dropdown.hide();
+            }
+        });
 }
 
 function populateCopyButton() {
-    var copyButton;
-    $('pre code').each(function () {
-        var copyButton = $('<span>', {
-            'class': 'btn-clipboard',
-            'data-clipboard-text': $(this).text(),
-            'title': 'Click to copy'
-        }).append('<i class="far fa-copy"></i>');
+    if (window._copyButtonInitialized) return;
+    window._copyButtonInitialized = true;
 
-        if ($(this).parent().width() > 100) {
-            copyButton.append('<span style="margin-left: 2px">Copy</span>');
+    // Copy functionality for filename headers (only on copy button click)
+    $(document).on('click.copy', '.highlight span.filename', function(e) {
+        var rect = this.getBoundingClientRect();
+        var clickX = e.clientX - rect.left;
+        var clickY = e.clientY - rect.top;
+
+        // Check if click is on the copy button area (right side of filename)
+        var isCopyButtonArea = (clickX > rect.width - 60 && clickY > rect.height * 0.25 && clickY < rect.height * 0.75);
+
+        if (isCopyButtonArea) {
+            var codeElement = $(this).next('pre').find('code');
+            if (codeElement.length === 0) {
+                codeElement = $(this).next('pre');
+            }
+
+            var textToCopy = codeElement.text();
+            copyToClipboard(textToCopy, this);
         }
-        
-        $(this).before($('<div>', {'class': 'copy-clipboard'})
-                .append(copyButton));
+    });
 
-        $(copyButton.get(0)).mouseleave(function () {
-            $(this).attr('class', 'btn-clipboard');
-            $(this).removeAttr('aria-label');
-        });
+    // Copy functionality for code blocks without filename (click on copy button area)
+    $(document).on('click.copy', '.content-description pre', function(e) {
+        // Skip if this pre follows a visible filename header (handled above)
+        var $filename = $(this).prev('.filename');
+        if ($filename.length > 0 && $filename.is(':visible')) return;
 
-        var curClipboard = new Clipboard(copyButton.get(0));
+        var rect = this.getBoundingClientRect();
+        var clickX = e.clientX - rect.left;
+        var clickY = e.clientY - rect.top;
 
-        curClipboard.on('success', function (e) {
-            e.clearSelection();
-            showTooltip(e.trigger, 'Copied!');
-        });
+        // Check if click is on the copy button (small area in top-right)
+        var isButtonArea = (clickX > rect.width - 40 && clickY < 32);
 
-        curClipboard.on('error', function (e) {
-            showTooltip(e.trigger, fallbackMessage(e.action));
-        });
+        if (isButtonArea) {
+            var codeElement = $(this).find('code');
+            if (codeElement.length === 0) {
+                codeElement = $(this);
+            }
+
+            var textToCopy = codeElement.text();
+            copyToClipboard(textToCopy, this);
+        }
     });
 }
 
+function initTabbedSets() {
+    // Initialize any uninitialized tabbed sets
+    $('.content-description .tabbed-set').not('[data-tabbed-init]').each(function() {
+        var $set = $(this);
+        $set.attr('data-tabbed-init', '1');
+        var $labels = $set.find('.tabbed-labels label');
+        var $blocks = $set.find('.tabbed-content .tabbed-block');
+
+        // Activate first tab by default
+        $labels.first().addClass('tabbed-label--active');
+        $blocks.first().addClass('tabbed-block--active');
+    });
+
+    // Delegated click handler (set up once)
+    if (!window._tabbedClickBound) {
+        window._tabbedClickBound = true;
+
+        $(document).on('click', '.tabbed-set .tabbed-labels label', function() {
+            var $label = $(this);
+            var $set = $label.closest('.tabbed-set');
+            var $labels = $set.find('.tabbed-labels label');
+            var $blocks = $set.find('.tabbed-content .tabbed-block');
+            var $inputs = $set.find('> input[type="radio"]');
+            var index = $labels.index($label);
+
+            $labels.removeClass('tabbed-label--active');
+            $blocks.removeClass('tabbed-block--active');
+            $label.addClass('tabbed-label--active');
+            $blocks.eq(index).addClass('tabbed-block--active');
+            $inputs.eq(index).prop('checked', true);
+        });
+    }
+}
+
+// Observe DOM for dynamically added content (e.g., AJAX preview)
+// Shared observer for all features that need re-init on dynamic content
+function initDynamicContentObserver() {
+    if (window._dynamicObserverBound) return;
+    window._dynamicObserverBound = true;
+
+    if (window.MutationObserver) {
+        var _debounce = null;
+        new MutationObserver(function() {
+            if (_debounce) return;
+            _debounce = setTimeout(function() {
+                _debounce = null;
+                initTabbedSets();
+            }, 100);
+        }).observe(document.body, { childList: true, subtree: true });
+    }
+}
+
+function copyToClipboard(text, target) {
+    // Use modern Clipboard API if available
+    if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(function() {
+            showCopyFeedback(target, 'Copied!');
+        }).catch(function(err) {
+            fallbackCopy(text, target);
+        });
+    } else {
+        fallbackCopy(text, target);
+    }
+}
+
+function fallbackCopy(text, target) {
+    // Fallback for older browsers
+    var textArea = document.createElement('textarea');
+    textArea.value = text;
+    textArea.style.position = 'fixed';
+    textArea.style.left = '-999999px';
+    textArea.style.top = '-999999px';
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+    
+    try {
+        document.execCommand('copy');
+        showCopyFeedback(target, 'Copied!');
+    } catch (err) {
+        showCopyFeedback(target, 'Copy failed');
+    }
+    
+    document.body.removeChild(textArea);
+}
+
+function showCopyFeedback(target, message) {
+    // Get the position of the copy button relative to the viewport
+    var container = $(target).closest('pre, .filename');
+    var containerRect = container[0].getBoundingClientRect();
+    var copyButtonTop = containerRect.top + (container.hasClass('filename') ? container.height() / 2 : 8);
+    var copyButtonRight = containerRect.right - 12;
+    
+    // Create a temporary feedback element positioned fixed to viewport
+    var feedback = $('<div>', {
+        class: 'copy-feedback',
+        text: message
+    }).css({
+        position: 'fixed',
+        top: copyButtonTop + 25 + 'px', // Position below the copy button
+        left: copyButtonRight - 45 + 'px', // Align with copy button, adjust for tooltip width
+        background: 'rgba(0, 0, 0, 0.9)',
+        color: '#fff',
+        padding: '6px 12px',
+        borderRadius: '6px',
+        fontSize: '12px',
+        fontFamily: 'system-ui, sans-serif',
+        zIndex: '10000', // Higher z-index to appear above everything
+        pointerEvents: 'none',
+        transform: 'translateY(-10px)',
+        opacity: '0',
+        transition: 'all 0.3s ease',
+        whiteSpace: 'nowrap',
+        boxShadow: '0 2px 8px rgba(0, 0, 0, 0.2)',
+        maxWidth: '120px',
+        textAlign: 'center'
+    });
+
+    
+    // Append to body to avoid affecting parent containers
+    $('body').append(feedback);
+    
+    // Check if tooltip would go off-screen and adjust position
+    var feedbackRect = feedback[0].getBoundingClientRect();
+    if (feedbackRect.right > window.innerWidth) {
+        feedback.css('left', (window.innerWidth - feedbackRect.width - 10) + 'px');
+    }
+    if (feedbackRect.left < 0) {
+        feedback.css('left', '10px');
+    }
+    if (feedbackRect.bottom > window.innerHeight) {
+        feedback.css('top', (copyButtonTop - 45) + 'px'); // Show above instead
+    }
+    
+    // Animate in
+    setTimeout(function() {
+        feedback.css({
+            opacity: '1',
+            transform: 'translateY(0)'
+        });
+    }, 10);
+    
+    // Remove after delay
+    setTimeout(function() {
+        feedback.css({
+            opacity: '0',
+            transform: 'translateY(-10px)'
+        });
+        setTimeout(function() {
+            feedback.remove();
+        }, 300);
+    }, 1500);
+}
+
+/**
+ * Register clipboard image paste handler for simple textareas.
+ * Note: For full PageDown editors, use MarkdownEditor class instead,
+ * which handles clipboard paste internally.
+ */
 function register_copy_clipboard($elements, callback) {
     $elements.on('paste', function(event) {
         const items = (event.clipboardData || event.originalEvent.clipboardData).items;
+        const textarea = this;
+        const $textarea = $(textarea);
         for (const index in items) {
             const item = items[index];
             if (item.kind === 'file' && item.type.indexOf('image') !== -1) {
                 const blob = item.getAsFile();
-                const formData = new FormData();
-                formData.append('image', blob);
+                $textarea.prop('disabled', true);
 
-                $(this).prop('disabled', true);
+                const uploader = (typeof DjangoPagedown !== 'undefined' && DjangoPagedown.uploadImage)
+                    ? DjangoPagedown.uploadImage(blob)
+                    : (function () {
+                        const formData = new FormData();
+                        formData.append('image', blob);
+                        return fetch('/pagedown/image-upload/', { method: 'POST', body: formData })
+                            .then(r => r.json())
+                            .then(d => d.url);
+                    })();
 
-                $.ajax({
-                    url: '/pagedown/image-upload/',
-                    type: 'POST',
-                    data: formData,
-                    processData: false,
-                    contentType: false,
-                    success: function(data) {
-                        // Assuming the server returns the URL of the image
-                        const imageUrl = data.url;
-                        const editor = $(event.target); // Get the textarea where the event was triggered
-                        let currentMarkdown = editor.val();
-                        const markdownImageText = '![](' + imageUrl + ')'; // Markdown for an image
-                        
+                uploader
+                    .then(function (imageUrl) {
+                        let currentMarkdown = $textarea.val();
+                        const markdownImageText = '![](' + imageUrl + ')';
                         if (currentMarkdown) currentMarkdown += "\n";
                         currentMarkdown += markdownImageText;
-
-                        editor.val(currentMarkdown);
+                        $textarea.val(currentMarkdown);
                         callback?.();
-                    },
-                    error: function() {
+                    })
+                    .catch(function () {
                         alert('There was an error uploading the image.');
-                    },
-                    complete: () => {
-                        // Re-enable the editor
-                        $(this).prop('disabled', false).focus();
-                    }
-                });
-                
+                    })
+                    .finally(function () {
+                        $textarea.prop('disabled', false).focus();
+                    });
+
                 // We only handle the first image in the clipboard data
                 break;
             }
@@ -359,7 +531,10 @@ function register_copy_clipboard($elements, callback) {
 }
 
 function activateBlogBoxOnClick() {
-    $('.blog-box').on('click', function () {
+    $('.blog-box').on('click', function (e) {
+        if ($(e.target).closest('.actionbar-box, .inline-comments-container, .comment-area, a, button, select, input').length) {
+            return;
+        }
         var $description = $(this).children('.blog-description');
         var max_height = $description.css('max-height');
         if (max_height !== 'fit-content') {
@@ -622,6 +797,7 @@ function onWindowReady() {
 
     $('.tabs').each(function () {
         var $this = $(this), $h2 = $(this).find('h2'), $ul = $(this).find('ul');
+        if (!$h2.length) return;
         var cutoff = ($h2.textWidth() || 400) + 20, handler;
         $ul.children().each(function () {
             cutoff += $(this).width();
@@ -657,8 +833,6 @@ function onWindowReady() {
         }
     });
 
-    register_copy_clipboard($('textarea.wmd-input'));
-
     $('form').submit(function (evt) {
         // Prevent multiple submissions of forms, see #565
         $("input[type='submit']").prop('disabled', true);
@@ -671,13 +845,16 @@ function onWindowReady() {
     $('#logout').on('click', () => $('#logout-form').submit());
 
     populateCopyButton();
-    
+    initTabbedSets();
+    initDynamicContentObserver();
+
     $('a').click(function() {
         var href = $(this).attr('href');
         var target = $(this).attr('target');
-        if (!href || href === '#' || href.startsWith("javascript") || 
+        if (!href || href === '#' || href.startsWith("javascript") ||
             $(this).attr("data-featherlight") ||
-            target === "_blank"
+            target === "_blank" ||
+            href.startsWith("#")
         ) {
             return;
         }
@@ -686,7 +863,7 @@ function onWindowReady() {
         $("#loading-bar").animate({ width: "100%" }, 2000, function() {
             $(this).stop(true, true);
             $(this).hide().css({ width: 0});
-        }); 
+        });
     });
 
     $('.errorlist').each(function() {

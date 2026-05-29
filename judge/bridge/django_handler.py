@@ -18,6 +18,8 @@ class DjangoHandler(ZlibPacketHandler):
             "submission-request": self.on_submission,
             "terminate-submission": self.on_termination,
             "disconnect-judge": self.on_disconnect_request,
+            "validate-request": self.on_validate_request,
+            "update-problems": self.on_update_problems,
         }
         self.judges = judges
 
@@ -43,9 +45,10 @@ class DjangoHandler(ZlibPacketHandler):
         source = data["source"]
         judge_id = data["judge-id"]
         priority = data["priority"]
+        user_id = data.get("user-id")
         if not self.judges.check_priority(priority):
             return {"name": "bad-request"}
-        self.judges.judge(id, problem, language, source, judge_id, priority)
+        self.judges.judge(id, problem, language, source, judge_id, priority, user_id)
         return {"name": "submission-received", "submission-id": id}
 
     def on_termination(self, data):
@@ -53,6 +56,19 @@ class DjangoHandler(ZlibPacketHandler):
             "name": "submission-received",
             "judge-aborted": self.judges.abort(data["submission-id"]),
         }
+
+    def on_validate_request(self, data):
+        validate_id = data["validate-id"]
+        problem_id = data["problem-id"]
+        success = self.judges.validate(validate_id, problem_id)
+        return {
+            "name": "validate-received" if success else "validate-failed",
+            "validate-id": validate_id,
+        }
+
+    def on_update_problems(self, data):
+        self.judges.broadcast_update_problems()
+        return {"name": "update-problems-received"}
 
     def on_disconnect_request(self, data):
         judge_id = data["judge-id"]

@@ -12,7 +12,7 @@ https://docs.djangoproject.com/en/1.11/ref/settings/
 import os
 import tempfile
 
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 from django_jinja.builtins import DEFAULT_EXTENSIONS
 from jinja2 import select_autoescape
 
@@ -56,6 +56,10 @@ DMOJ_CAMO_KEY = None
 DMOJ_CAMO_HTTPS = False
 DMOJ_CAMO_EXCLUDE = ()
 DMOJ_PROBLEM_DATA_ROOT = None
+# Push problem data updates to judges via bridge.
+# Disabled by default so local/dev installs without a bridge do not hang on
+# socket timeouts. Set to True only when a bridge is running and reachable.
+DMOJ_PROBLEM_DATA_PUSH_UPDATE = False
 DMOJ_PROBLEM_MIN_TIME_LIMIT = 0  # seconds
 DMOJ_PROBLEM_MAX_TIME_LIMIT = 60  # seconds
 DMOJ_PROBLEM_MIN_MEMORY_LIMIT = 0  # kilobytes
@@ -86,7 +90,13 @@ DMOJ_STATS_SUBMISSION_RESULT_COLORS = {
 }
 DMOJ_PROFILE_IMAGE_ROOT = "profile_images"
 DMOJ_ORGANIZATION_IMAGE_ROOT = "organization_images"
-DMOJ_TEST_FORMATTER_ROOT = "test_formatter"
+DMOJ_COURSE_IMAGE_ROOT = "course_images"
+
+DMOJ_USER_MAX_FILE_SIZE = 5 * 1024 * 1024
+DMOJ_USER_MAX_STORAGE = 30 * 1024 * 1024
+DMOJ_ADMIN_MAX_FILE_SIZE = 10 * 1024 * 1024
+DMOJ_ADMIN_MAX_STORAGE = 100 * 1024 * 1024
+DMOJ_MAX_FILES_PER_USER = 100
 
 MARKDOWN_STYLES = {}
 MARKDOWN_DEFAULT_STYLE = {}
@@ -184,6 +194,23 @@ else:
                     ],
                 },
                 {
+                    "model": "judge.Quiz",
+                    "icon": "fa-list-alt",
+                    "children": [
+                        "judge.QuizQuestion",
+                        "judge.QuizAttempt",
+                        "judge.QuizAnswer",
+                    ],
+                },
+                {
+                    "model": "judge.Course",
+                    "icon": "fa-graduation-cap",
+                    "children": [
+                        "judge.CourseLesson",
+                        "judge.CourseLessonQuiz",
+                    ],
+                },
+                {
                     "model": "auth.User",
                     "icon": "fa-user",
                     "children": [
@@ -252,10 +279,12 @@ MIDDLEWARE = (
     "judge.middleware.SlowRequestMiddleware",
     "judge.middleware.ShortCircuitMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
+    "judge.middleware.RequestScopedCacheMiddleware",
     "django.middleware.locale.LocaleMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "judge.middleware.InactiveUserLogoutMiddleware",
     "judge.middleware.DMOJLoginMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
@@ -264,6 +293,7 @@ MIDDLEWARE = (
     "impersonate.middleware.ImpersonateMiddleware",
     "judge.middleware.DMOJImpersonationMiddleware",
     "judge.middleware.ContestMiddleware",
+    "judge.middleware.CourseMiddleware",
     "judge.middleware.DarkModeMiddleware",
     "judge.middleware.SubdomainMiddleware",
     "django.contrib.flatpages.middleware.FlatpageFallbackMiddleware",
@@ -388,9 +418,8 @@ BRIDGED_AUTO_CREATE_JUDGE = False
 
 # Event Server configuration
 EVENT_DAEMON_USE = False
-EVENT_DAEMON_POST = "ws://localhost:9997/"
-EVENT_DAEMON_GET = "ws://localhost:9996/"
-EVENT_DAEMON_POLL = "/channels/"
+EVENT_DAEMON_URL = "ws://localhost:9996/"
+EVENT_DAEMON_PUBLIC_URL = "ws://localhost:9996/"
 EVENT_DAEMON_KEY = None
 EVENT_DAEMON_AMQP_EXCHANGE = "dmoj-events"
 EVENT_DAEMON_SUBMISSION_KEY = (
@@ -405,7 +434,6 @@ LANGUAGE_CODE = "vi"
 TIME_ZONE = "Asia/Ho_Chi_Minh"
 DEFAULT_USER_TIME_ZONE = "Asia/Ho_Chi_Minh"
 USE_I18N = True
-USE_L10N = True
 USE_TZ = True
 
 # Cookies
@@ -423,6 +451,7 @@ STATICFILES_DIRS = [
     os.path.join(BASE_DIR, "resources"),
 ]
 STATIC_URL = "/static/"
+MEDIA_URL = "/media/"
 
 # Define a cache
 CACHES = {}
@@ -473,7 +502,15 @@ FILE_UPLOAD_PERMISSIONS = 0o644
 
 MESSAGES_TO_LOAD = 15
 
-ML_OUTPUT_PATH = None
+USE_ML = False
+GEMINI_API_KEY = None
+SEMANTIC_SEARCH_MODEL = "gemini-embedding-2"
+SEMANTIC_SEARCH_DIM = 768
+SEMANTIC_SEARCH_QUERY_CACHE_TTL = 86400
+SEMANTIC_SEARCH_EMBEDDING_REQUESTS_PER_MINUTE = 1500
+SEMANTIC_SEARCH_EMBEDDING_BATCH_SIZE = 50
+SEMANTIC_SEARCH_EMBEDDING_MAX_RETRIES = 5
+SEMANTIC_SEARCH_EMBEDDING_RETRY_INITIAL_SLEEP = 5
 
 # Use subdomain for organizations
 USE_SUBDOMAIN = False
@@ -492,6 +529,12 @@ CHUNK_UPLOAD_DIR = "/tmp/chunk_upload_tmp"
 # Rate limit
 RL_VOTE = "200/h"
 RL_COMMENT = "30/h"
+RL_EMAIL_CHANGE = "5/h"
+RL_PASSWORD_RESET = "20/h"
+RL_SEMANTIC_SEARCH = "5/m"
+
+# Anonymous users may only access the first N pages of paginated listings.
+ANON_MAX_PAGE = 3
 
 
 try:
@@ -499,3 +542,12 @@ try:
         exec(f.read(), globals())
 except IOError:
     pass
+
+# Register local_settings.py for autoreload (only affects runserver, not production)
+from django.utils import autoreload
+
+autoreload.autoreload_started.connect(
+    lambda sender, **kwargs: sender.watch_file(
+        os.path.join(os.path.dirname(__file__), "local_settings.py")
+    )
+)

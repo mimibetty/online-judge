@@ -21,7 +21,7 @@
       });
     });
   </script>
-  {% if form.captcha %}
+  {% if form.captcha and use_recaptcha %}
     {{ recaptcha_init(LANGUAGE_CODE) }}
   {% endif %}
 {% endblock %}
@@ -86,7 +86,7 @@
       {% endif %}
 
       <hr>
-      <button style="float:right;" type="submit">{{ _('Register!') }}</button>
+      <button style="float:right;" type="submit" class="action-btn">{{ _('Register!') }}</button>
     </form>
   </div>
 

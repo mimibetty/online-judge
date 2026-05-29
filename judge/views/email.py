@@ -1,20 +1,30 @@
 from django.contrib.auth.tokens import default_token_generator
+from django.contrib.auth.views import PasswordResetView
 from django.core.mail import send_mail
 from django.shortcuts import render, redirect
+from django.utils.decorators import method_decorator
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
-from django.utils.encoding import force_bytes, force_text
 from django.conf import settings
 from django import forms
 from django.utils.translation import gettext_lazy as _
 from django.urls import reverse
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
-from django.contrib.auth.hashers import check_password
+from django.http import Http404
+from django.utils.encoding import force_bytes
 
-from urllib.parse import urlencode, urlunparse, urlparse
 
-from judge.models import Profile
+from judge.models import Profile, EmailChangeRequest
 from judge.utils.email_render import render_email_message
+from judge.utils.ratelimit import ratelimit
+
+
+@method_decorator(
+    ratelimit(key="ip", rate=settings.RL_PASSWORD_RESET, method=["POST"]),
+    name="dispatch",
+)
+class RateLimitedPasswordResetView(PasswordResetView):
+    pass
 
 
 class EmailChangeForm(forms.Form):
@@ -38,6 +48,7 @@ class EmailChangeForm(forms.Form):
         return password
 
 
+@ratelimit(key="user", rate=settings.RL_EMAIL_CHANGE, method=["POST"])
 @login_required
 def email_change_view(request):
     form = EmailChangeForm(request.POST or None, user=request.user)
@@ -67,12 +78,12 @@ def email_change_view(request):
         send_mail(
             subject,
             message,
-            settings.EMAIL_HOST_USER,
+            settings.DEFAULT_FROM_EMAIL,
             [new_email],
             html_message=message,
         )
-        profile.email_change_pending = new_email
-        profile.save()
+        EmailChangeRequest.objects.filter(profile=profile).delete()
+        EmailChangeRequest.objects.create(profile=profile, new_email=new_email)
         return redirect("email_change_pending")
 
     return render(
@@ -87,18 +98,23 @@ def email_change_view(request):
 
 def verify_email_view(request, uidb64, token):
     try:
-        uid = force_text(urlsafe_base64_decode(uidb64))
+        uid = str(urlsafe_base64_decode(uidb64), encoding="utf-8")
         user = User.objects.get(pk=uid)
     except (TypeError, ValueError, OverflowError, User.DoesNotExist):
         user = None
     if user is not None and default_token_generator.check_token(user, token):
         profile = Profile.objects.get(user=user)
-        new_email = profile.email_change_pending
-        if new_email and not User.objects.filter(email=new_email).exists():
-            user.email = new_email
-            profile.email_change_pending = None
+        email_change_request = EmailChangeRequest.objects.filter(
+            profile=profile
+        ).first()
+
+        if (
+            email_change_request
+            and not User.objects.filter(email=email_change_request.new_email).exists()
+        ):
+            user.email = email_change_request.new_email
             user.save()
-            profile.save()
+            email_change_request.delete()
 
             return render(
                 request,
@@ -112,10 +128,14 @@ def verify_email_view(request, uidb64, token):
 
 
 def email_change_pending_view(request):
+    email_change_request = EmailChangeRequest.objects.filter(
+        profile=request.profile
+    ).first()
+    if not email_change_request:
+        raise Http404()
+    new_email = email_change_request.new_email
     return render(
         request,
         "email_change/email_change_pending.html",
-        {
-            "title": _("Email change pending"),
-        },
+        {"title": _("Email change pending"), "new_email": new_email},
     )

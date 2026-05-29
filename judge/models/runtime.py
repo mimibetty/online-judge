@@ -147,12 +147,8 @@ class Language(models.Model):
         return reverse("runtime_list") + "#" + self.key
 
     @classmethod
-    def get_default_language(cls):
-        return _get_default_language()
-
-    @classmethod
     def get_default_language_pk(cls):
-        return _get_default_language().pk
+        return _get_default_language_pk()
 
     class Meta:
         ordering = ["key"]
@@ -160,12 +156,14 @@ class Language(models.Model):
         verbose_name_plural = _("languages")
 
 
-@cache_wrapper(prefix="gdl")
-def _get_default_language():
+@cache_wrapper(prefix="gdlpk", expected_type=int)
+def _get_default_language_pk():
     try:
-        return Language.objects.get(key=settings.DEFAULT_USER_LANGUAGE)
+        return Language.objects.values_list("pk", flat=True).get(
+            key=settings.DEFAULT_USER_LANGUAGE
+        )
     except Language.DoesNotExist:
-        return cls.get_python3()
+        return Language.get_python3().pk
 
 
 class RuntimeVersion(models.Model):
@@ -265,3 +263,8 @@ class Judge(models.Model):
         ordering = ["name"]
         verbose_name = _("judge")
         verbose_name_plural = _("judges")
+
+
+@cache_wrapper(prefix="galkn", timeout=1800)
+def get_all_languages():
+    return list(Language.objects.values("key", "name", "id", "common_name"))

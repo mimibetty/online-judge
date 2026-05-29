@@ -5,7 +5,6 @@ from django.db import models
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
-from django.utils.functional import cached_property
 from django.contrib.contenttypes.fields import GenericRelation
 from mptt.fields import TreeForeignKey
 from mptt.models import MPTTModel
@@ -96,9 +95,15 @@ class BlogPost(models.Model, PageVotable, Bookmarkable):
     is_organization_private = models.BooleanField(
         verbose_name=_("private to organizations"), default=False
     )
+    is_rejected = models.BooleanField(
+        verbose_name=_("rejected"),
+        default=False,
+        help_text=_("True if post was rejected by moderator"),
+    )
     comments = GenericRelation("Comment")
     pagevote = GenericRelation("PageVote")
     bookmark = GenericRelation("BookMark")
+    tickets = GenericRelation("Ticket")
 
     def __str__(self):
         return self.title
@@ -110,6 +115,8 @@ class BlogPost(models.Model, PageVotable, Bookmarkable):
         if self.visible and self.publish_on <= timezone.now():
             if not self.is_organization_private:
                 return True
+            if self.organizations.filter(is_open=True).exists():
+                return True
             if (
                 user.is_authenticated
                 and self.organizations.filter(
@@ -117,7 +124,7 @@ class BlogPost(models.Model, PageVotable, Bookmarkable):
                 ).exists()
             ):
                 return True
-        if user.has_perm("judge.edit_all_post"):
+        if user.is_superuser:
             return True
         return (
             user.is_authenticated and self.authors.filter(id=user.profile.id).exists()
@@ -126,18 +133,70 @@ class BlogPost(models.Model, PageVotable, Bookmarkable):
     def is_editable_by(self, user):
         if not user.is_authenticated:
             return False
-        if user.has_perm("judge.edit_all_post"):
+        if user.is_superuser:
             return True
-        return (
-            user.has_perm("judge.change_blogpost")
-            and self.authors.filter(id=user.profile.id).exists()
-        )
+        return user.profile.id in self.get_author_ids()
 
-    @cache_wrapper(prefix="BPga", expected_type=models.query.QuerySet)
+    @cache_wrapper(prefix="BPgai", expected_type=list)
+    def get_author_ids(self):
+        return list(self.authors.values_list("id", flat=True))
+
     def get_authors(self):
-        return self.authors.only("id")
+        return Profile.get_cached_instances(*self.get_author_ids())
+
+    def get_organization_ids(self):
+        return _get_blogpost_organization_ids(self.id)
+
+    @classmethod
+    def prefetch_organization_ids(cls, *blogpost_ids):
+        _get_blogpost_organization_ids.batch([(id,) for id in blogpost_ids])
+
+    def get_organizations(self):
+        organization_ids = self.get_organization_ids()
+        return Organization.get_cached_instances(*organization_ids)
 
     class Meta:
         permissions = (("edit_all_post", _("Edit all posts")),)
         verbose_name = _("blog post")
         verbose_name_plural = _("blog posts")
+
+
+def _get_blogpost_organization_ids_batch(args_list):
+    """
+    Batch function to get organization IDs for multiple blog posts efficiently.
+
+    Args:
+        args_list: List of tuples, each containing a single blogpost_id
+
+    Returns:
+        List of organization ID lists, one for each blogpost_id in args_list
+    """
+    # Extract blog post IDs from args_list
+    blogpost_ids = [args[0] for args in args_list]
+
+    # Direct query to the through table to avoid JOIN
+    through_model = BlogPost.organizations.through
+    query = through_model.objects.filter(blogpost_id__in=blogpost_ids)
+
+    # Group organization IDs by blog post ID
+    blogpost_orgs = {}
+    for blogpost_id, org_id in query.values_list("blogpost_id", "organization_id"):
+        if blogpost_id not in blogpost_orgs:
+            blogpost_orgs[blogpost_id] = []
+        blogpost_orgs[blogpost_id].append(org_id)
+
+    # Return results in the same order as input blogpost_ids
+    results = []
+    for blogpost_id in blogpost_ids:
+        results.append(blogpost_orgs.get(blogpost_id, []))
+
+    return results
+
+
+@cache_wrapper(
+    prefix="BPgoi", expected_type=list, batch_fn=_get_blogpost_organization_ids_batch
+)
+def _get_blogpost_organization_ids(blogpost_id):
+    """Get organization IDs for a blog post"""
+    results = _get_blogpost_organization_ids_batch([(blogpost_id,)])
+    return results[0]

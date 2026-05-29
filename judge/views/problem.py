@@ -1,30 +1,20 @@
+import difflib
+import json
 import logging
 import os
-import shutil
+from copy import deepcopy
 from operator import itemgetter
 from random import randrange
-from copy import deepcopy
 
-from django.core.cache import cache
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.mixins import PermissionRequiredMixin
+from django.contrib import messages
 from django.core.exceptions import ObjectDoesNotExist, PermissionDenied
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
 from django.db import transaction
-from django.db.models import (
-    BooleanField,
-    Case,
-    CharField,
-    Count,
-    F,
-    FilteredRelation,
-    Prefetch,
-    Q,
-    When,
-    IntegerField,
-    Sum,
-)
-from django.db.models.functions import Coalesce
+from django.db.models import Prefetch, Q
 from django.db.utils import ProgrammingError
 from django.http import (
     Http404,
@@ -41,45 +31,55 @@ from django.utils.functional import cached_property
 from django.utils.html import escape, format_html
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext as _, gettext_lazy
-from django.views.generic import ListView, View
+from django.views.generic import ListView, View, CreateView
 from django.views.generic.base import TemplateResponseMixin
 from django.views.generic.detail import SingleObjectMixin
 
-from judge.views.comment import CommentedDetailView
-from judge.forms import ProblemCloneForm, ProblemSubmitForm, ProblemPointsVoteForm
+from judge.views.comment import CommentableMixin
+from judge.forms import (
+    ProblemCloneForm,
+    ProblemSubmitForm,
+    ProblemEditForm,
+    ProblemAddForm,
+    LanguageLimitEditForm,
+    LanguageTemplateEditForm,
+    ProblemSolutionEditForm,
+    ProblemTranslationEditForm,
+)
 from judge.models import (
     ContestProblem,
     ContestSubmission,
     Judge,
     Language,
+    LanguageLimit,
+    LanguageTemplate,
     Problem,
+    ProblemData,
     ContestProblemClarification,
-    ProblemGroup,
     ProblemTranslation,
-    ProblemType,
-    ProblemPointsVote,
     RuntimeVersion,
     Solution,
     Submission,
     SubmissionSource,
-    Organization,
     Profile,
-    LanguageTemplate,
     Contest,
 )
+from judge.models.problem_data import ProblemSolutionCode
 from judge.pdf_problems import DefaultPdfMaker, HAS_PDF
 from judge.utils.diggpaginator import DiggPaginator
 from judge.utils.opengraph import generate_opengraph
 from judge.utils.problems import (
     contest_attempted_ids,
     contest_completed_ids,
-    hot_problems,
     user_attempted_ids,
     user_completed_ids,
     get_related_problems,
     get_user_recommended_problems,
     RecommendationType,
 )
+from judge.utils.contest_recommendation import get_contests_for_problem
+from judge.utils.storage_helpers import serve_file_inline
+from judge.utils.permissions import can_use_ai_features
 from judge.utils.strings import safe_float_or_none, safe_int_or_none
 from judge.utils.tickets import own_ticket_filter
 from judge.utils.views import (
@@ -88,10 +88,26 @@ from judge.utils.views import (
     TitleMixin,
     generic_message,
 )
-from judge.ml.collab_filter import CollabFilter
 from judge.views.pagevote import PageVoteDetailView
 from judge.views.bookmark import BookMarkDetailView
 from judge.views.feed import FeedView
+from judge.models.problem import (
+    get_distinct_problem_points,
+    get_all_problem_types,
+    get_all_problem_groups,
+)
+from judge.models.runtime import get_all_languages
+
+import reversion
+from django.apps import apps
+from reversion.models import Version
+
+from judge.tasks import rescore_problem
+from judge.tasks.llm import (
+    generate_solution_task,
+    improve_markdown_task,
+    tag_problem_task,
+)
 
 
 def get_contest_problem(problem, profile):
@@ -140,7 +156,7 @@ class ProblemMixin(object):
     def get(self, request, *args, **kwargs):
         try:
             return super(ProblemMixin, self).get(request, *args, **kwargs)
-        except Http404 as e:
+        except Http404:
             return self.no_such_problem()
 
 
@@ -157,13 +173,13 @@ class SolvedProblemMixin(object):
         else:
             return user_attempted_ids(self.profile) if self.profile is not None else ()
 
-    def get_latest_attempted_problems(self, limit=None, queryset=None):
+    def get_latest_attempted_problems(self, limit=None, queryset_ids=None):
         if self.in_contest or not self.profile:
             return ()
-        result = list(user_attempted_ids(self.profile).values())
-        if queryset:
-            queryset_ids = set([i.code for i in queryset])
-            result = filter(lambda i: i["code"] in queryset_ids, result)
+        result = user_attempted_ids(self.profile)
+        if queryset_ids:
+            result = {i: v for i, v in result.items() if i in queryset_ids}
+        result = list(result.values())
         result = sorted(result, key=lambda d: -d["last_submission"])
         if limit:
             result = result[:limit]
@@ -171,11 +187,8 @@ class SolvedProblemMixin(object):
 
     @cached_property
     def in_contest(self):
-        return (
-            self.profile is not None
-            and self.profile.current_contest is not None
-            and self.request.in_contest_mode
-        )
+        # General problem views are not contest-scoped
+        return False
 
     @cached_property
     def contest(self):
@@ -192,9 +205,12 @@ class ProblemSolution(
     SolvedProblemMixin,
     ProblemMixin,
     TitleMixin,
-    CommentedDetailView,
+    CommentableMixin,
     PageVoteDetailView,
     BookMarkDetailView,
+    TemplateResponseMixin,
+    SingleObjectMixin,
+    View,
 ):
     context_object_name = "solution"
     template_name = "problem/editorial.html"
@@ -214,9 +230,17 @@ class ProblemSolution(
         solution = get_object_or_404(Solution, problem=self.problem)
         return solution
 
+    def get(self, request, *args, **kwargs):
+        self.object = self.get_object()
+        return self.render_to_response(
+            self.get_context_data(
+                object=self.object,
+            )
+        )
+
     def get_context_data(self, **kwargs):
         context = super(ProblemSolution, self).get_context_data(**kwargs)
-        solution = self.get_object()
+        solution = self.object
         if (
             not solution.is_public or solution.publish_on > timezone.now()
         ) and not self.request.user.has_perm("judge.see_private_solution"):
@@ -224,6 +248,11 @@ class ProblemSolution(
 
         context["problem"] = self.problem
         context["has_solved_problem"] = self.problem.id in self.get_completed_problems()
+        context["can_edit_problem"] = self.problem.is_editable_by(self.request.user)
+
+        # Add comment context
+        context = self.get_comment_context(context)
+
         return context
 
 
@@ -238,7 +267,15 @@ class ProblemRaw(
 
     def get_context_data(self, **kwargs):
         context = super(ProblemRaw, self).get_context_data(**kwargs)
+        user = self.request.user
+        authed = user.is_authenticated
         context["problem_name"] = self.object.name
+        contest_problem = (
+            None
+            if not authed or user.profile.current_contest is None
+            else get_contest_problem(self.object, user.profile)
+        )
+        context["contest_problem"] = contest_problem
         context["url"] = self.request.build_absolute_uri()
         context["description"] = self.object.description
         if hasattr(self.object, "data_files"):
@@ -262,12 +299,23 @@ class ProblemRaw(
 class ProblemDetail(
     ProblemMixin,
     SolvedProblemMixin,
-    CommentedDetailView,
+    CommentableMixin,
     PageVoteDetailView,
     BookMarkDetailView,
+    TemplateResponseMixin,
+    SingleObjectMixin,
+    View,
 ):
     context_object_name = "problem"
     template_name = "problem/problem.html"
+
+    def get(self, request, *args, **kwargs):
+        self.object = self.get_object()
+        return self.render_to_response(
+            self.get_context_data(
+                object=self.object,
+            )
+        )
 
     def get_context_data(self, **kwargs):
         context = super(ProblemDetail, self).get_context_data(**kwargs)
@@ -279,6 +327,9 @@ class ProblemDetail(
                 user=user.profile, problem=self.object
             ).exists()
         )
+
+        # Make sure we pass the object to the template
+        context["object"] = self.object
         contest_problem = (
             None
             if not authed or user.profile.current_contest is None
@@ -303,8 +354,8 @@ class ProblemDetail(
         context["available_judges"] = Judge.objects.filter(
             online=True, problems=self.object
         )
-        context["show_languages"] = (
-            self.object.allowed_languages.count() != Language.objects.count()
+        context["show_languages"] = len(self.object.get_allowed_languages()) != len(
+            get_all_languages()
         )
         context["has_pdf_render"] = HAS_PDF
         context["completed_problem_ids"] = self.get_completed_problems()
@@ -316,29 +367,16 @@ class ProblemDetail(
             tickets = self.object.tickets
             if not can_edit:
                 tickets = tickets.filter(own_ticket_filter(user.profile.id))
-            context["has_tickets"] = tickets.exists()
-            context["num_open_tickets"] = (
-                tickets.filter(is_open=True).values("id").distinct().count()
-            )
+            tickets = list(tickets.values("id", "is_open"))
 
-        try:
-            context["editorial"] = Solution.objects.get(problem=self.object)
-        except ObjectDoesNotExist:
-            pass
-        try:
-            translation = self.object.translations.get(
-                language=self.request.LANGUAGE_CODE
-            )
-        except ProblemTranslation.DoesNotExist:
-            context["title"] = self.object.name
-            context["language"] = settings.LANGUAGE_CODE
-            context["description"] = self.object.description
-            context["translated"] = False
-        else:
-            context["title"] = translation.name
-            context["language"] = self.request.LANGUAGE_CODE
-            context["description"] = translation.description
-            context["translated"] = True
+            context["has_tickets"] = len(tickets) > 0
+            context["num_open_tickets"] = len([t for t in tickets if t["is_open"]])
+
+        context["title"] = self.object.translated_name(self.request.LANGUAGE_CODE)
+        context["language"] = self.request.LANGUAGE_CODE
+        context["description"] = self.object.translated_description(
+            self.request.LANGUAGE_CODE
+        )
 
         if not self.object.og_image or not self.object.summary:
             metadata = generate_opengraph(
@@ -353,10 +391,16 @@ class ProblemDetail(
         else:
             context["fileio_input"] = None
             context["fileio_output"] = None
-        if not self.in_contest and settings.ML_OUTPUT_PATH:
+        if not self.in_contest and getattr(settings, "USE_ML", False):
             context["related_problems"] = get_related_problems(
                 self.profile, self.object
             )
+
+        if not self.in_contest and not (self.profile and self.profile.current_contest):
+            context["contest_list"] = get_contests_for_problem(self.object.id)
+
+        # Add comment context
+        context = self.get_comment_context(context)
 
         return context
 
@@ -383,11 +427,10 @@ class ProblemPdfView(ProblemMixin, SingleObjectMixin, View):
         except ProblemTranslation.DoesNotExist:
             trans = None
 
-        cache = os.path.join(
-            settings.DMOJ_PDF_PROBLEM_CACHE, "%s.%s.pdf" % (problem.code, language)
-        )
+        # Use default_storage for PDF cache (works with S3 and local)
+        cache_path = "pdf_cache/%s.%s.pdf" % (problem.code, language)
 
-        if not os.path.exists(cache):
+        if not default_storage.exists(cache_path):
             self.logger.info("Rendering: %s.%s.pdf", problem.code, language)
             with DefaultPdfMaker() as maker, translation.override(language):
                 problem_name = problem.name if trans is None else trans.name
@@ -397,9 +440,11 @@ class ProblemPdfView(ProblemMixin, SingleObjectMixin, View):
                         {
                             "problem": problem,
                             "problem_name": problem_name,
-                            "description": problem.description
-                            if trans is None
-                            else trans.description,
+                            "description": (
+                                problem.description
+                                if trans is None
+                                else trans.description
+                            ),
                             "url": request.build_absolute_uri(),
                         }
                     )
@@ -416,26 +461,17 @@ class ProblemPdfView(ProblemMixin, SingleObjectMixin, View):
                     return HttpResponse(
                         maker.log, status=500, content_type="text/plain"
                     )
-                shutil.move(maker.pdffile, cache)
-        response = HttpResponse()
-        if hasattr(settings, "DMOJ_PDF_PROBLEM_INTERNAL") and request.META.get(
-            "SERVER_SOFTWARE", ""
-        ).startswith("nginx/"):
-            response["X-Accel-Redirect"] = "%s/%s.%s.pdf" % (
-                settings.DMOJ_PDF_PROBLEM_INTERNAL,
-                problem.code,
-                language,
-            )
-        else:
-            with open(cache, "rb") as f:
-                response.content = f.read()
+                # Save rendered PDF to storage
+                with open(maker.pdffile, "rb") as f:
+                    default_storage.save(cache_path, ContentFile(f.read()))
 
-        response["Content-Type"] = "application/pdf"
-        response["Content-Disposition"] = "inline; filename=%s.%s.pdf" % (
-            problem.code,
-            language,
+        return serve_file_inline(
+            request,
+            default_storage,
+            cache_path,
+            content_type="application/pdf",
+            inline_filename="%s.%s.pdf" % (problem.code, language),
         )
-        return response
 
 
 class ProblemPdfDescriptionView(ProblemMixin, SingleObjectMixin, View):
@@ -443,16 +479,14 @@ class ProblemPdfDescriptionView(ProblemMixin, SingleObjectMixin, View):
         problem = self.get_object()
         if not problem.pdf_description:
             raise Http404()
-        response = HttpResponse()
-        # if request.META.get("SERVER_SOFTWARE", "").startswith("nginx/"):
-        #     response["X-Accel-Redirect"] = problem.pdf_description.path
-        # else:
-        with open(problem.pdf_description.path, "rb") as f:
-            response.content = f.read()
 
-        response["Content-Type"] = "application/pdf"
-        response["Content-Disposition"] = "inline; filename=%s.pdf" % (problem.code,)
-        return response
+        return serve_file_inline(
+            request,
+            problem.pdf_description.storage,
+            problem.pdf_description.name,
+            content_type="application/pdf",
+            inline_filename="%s.pdf" % problem.code,
+        )
 
 
 class ProblemList(QueryStringSortMixin, TitleMixin, SolvedProblemMixin, ListView):
@@ -462,11 +496,9 @@ class ProblemList(QueryStringSortMixin, TitleMixin, SolvedProblemMixin, ListView
     template_name = "problem/list.html"
     paginate_by = 50
     sql_sort = frozenset(("date", "points", "ac_rate", "user_count", "code"))
-    manual_sort = frozenset(("name", "group", "solved", "type"))
+    manual_sort = frozenset(("name", "group", "solved"))
     all_sorts = sql_sort | manual_sort
     default_desc = frozenset(("date", "points", "ac_rate", "user_count"))
-    first_page_href = None
-    filter_organization = False
 
     def get_default_sort_order(self, request):
         if "search" in request.GET and settings.ENABLE_FTS:
@@ -487,7 +519,6 @@ class ProblemList(QueryStringSortMixin, TitleMixin, SolvedProblemMixin, ListView
             **kwargs,
         )
         if not self.in_contest:
-            queryset = queryset.add_i18n_name(self.request.LANGUAGE_CODE)
             queryset = self.sort_queryset(queryset)
             paginator.object_list = queryset
         return paginator
@@ -497,7 +528,7 @@ class ProblemList(QueryStringSortMixin, TitleMixin, SolvedProblemMixin, ListView
         if sort_key in self.sql_sort:
             queryset = queryset.order_by(self.order)
         elif sort_key == "name":
-            queryset = queryset.order_by(self.order.replace("name", "i18n_name"))
+            queryset = queryset.order_by(self.order)
         elif sort_key == "group":
             queryset = queryset.order_by(self.order + "__name")
         elif sort_key == "solved":
@@ -506,10 +537,10 @@ class ProblemList(QueryStringSortMixin, TitleMixin, SolvedProblemMixin, ListView
                 solved = user_completed_ids(profile)
                 attempted = user_attempted_ids(profile)
 
-                def _solved_sort_order(problem):
-                    if problem.id in solved:
+                def _solved_sort_order(problem_id):
+                    if problem_id in solved:
                         return 1
-                    if problem.id in attempted:
+                    if problem_id in attempted:
                         return 0
                     return -1
 
@@ -517,15 +548,7 @@ class ProblemList(QueryStringSortMixin, TitleMixin, SolvedProblemMixin, ListView
                 queryset.sort(
                     key=_solved_sort_order, reverse=self.order.startswith("-")
                 )
-        elif sort_key == "type":
-            if self.show_types:
-                queryset = list(queryset)
-                queryset.sort(
-                    key=lambda problem: problem.types_list[0]
-                    if problem.types_list
-                    else "",
-                    reverse=self.order.startswith("-"),
-                )
+
         return queryset
 
     @cached_property
@@ -535,52 +558,14 @@ class ProblemList(QueryStringSortMixin, TitleMixin, SolvedProblemMixin, ListView
         return self.request.profile
 
     def get_contest_queryset(self):
-        queryset = (
-            self.profile.current_contest.contest.contest_problems.select_related(
-                "problem__group"
-            )
-            .defer("problem__description")
-            .order_by("problem__code")
-            .annotate(user_count=Count("submission__participation", distinct=True))
-            .annotate(
-                i18n_translation=FilteredRelation(
-                    "problem__translations",
-                    condition=Q(
-                        problem__translations__language=self.request.LANGUAGE_CODE
-                    ),
-                )
-            )
-            .annotate(
-                i18n_name=Coalesce(
-                    F("i18n_translation__name"),
-                    F("problem__name"),
-                    output_field=CharField(),
-                )
+        # Filter out quiz-only entries (where problem_id is None)
+        return (
+            self.profile.current_contest.contest.contest_problems.filter(
+                problem_id__isnull=False
             )
             .order_by("order")
+            .values_list("problem_id", flat=True)
         )
-        return [
-            {
-                "id": p["problem_id"],
-                "code": p["problem__code"],
-                "name": p["problem__name"],
-                "i18n_name": p["i18n_name"],
-                "group": {"full_name": p["problem__group__full_name"]},
-                "points": p["points"],
-                "partial": p["partial"],
-                "user_count": p["user_count"],
-            }
-            for p in queryset.values(
-                "problem_id",
-                "problem__code",
-                "problem__name",
-                "i18n_name",
-                "problem__group__full_name",
-                "points",
-                "partial",
-                "user_count",
-            )
-        ]
 
     def get_org_query(self, query):
         if not self.profile:
@@ -593,7 +578,6 @@ class ProblemList(QueryStringSortMixin, TitleMixin, SolvedProblemMixin, ListView
 
     def get_normal_queryset(self):
         queryset = Problem.get_visible_problems(self.request.user)
-        queryset = queryset.select_related("group")
         if self.profile is not None and self.hide_solved:
             solved_problems = self.get_completed_problems()
             queryset = queryset.exclude(id__in=solved_problems)
@@ -640,22 +624,12 @@ class ProblemList(QueryStringSortMixin, TitleMixin, SolvedProblemMixin, ListView
                     )
                 else:
                     queryset = substr_queryset
-        self.prepoint_queryset = queryset
         if self.point_start is not None:
             queryset = queryset.filter(points__gte=self.point_start)
         if self.point_end is not None:
             queryset = queryset.filter(points__lte=self.point_end)
 
-        queryset = queryset.annotate(
-            has_public_editorial=Sum(
-                Case(
-                    When(solution__is_public=True, then=1),
-                    default=0,
-                    output_field=IntegerField(),
-                )
-            )
-        )
-        return queryset.distinct()
+        return queryset.distinct().values_list("id", flat=True)
 
     def get_queryset(self):
         if self.in_contest:
@@ -666,8 +640,6 @@ class ProblemList(QueryStringSortMixin, TitleMixin, SolvedProblemMixin, ListView
     def get_context_data(self, **kwargs):
         context = super(ProblemList, self).get_context_data(**kwargs)
 
-        if self.request.organization:
-            self.filter_organization = True
         context["hide_solved"] = 0 if self.in_contest else int(self.hide_solved)
         context["show_types"] = 0 if self.in_contest else int(self.show_types)
         context["full_text"] = 0 if self.in_contest else int(self.full_text)
@@ -677,21 +649,22 @@ class ProblemList(QueryStringSortMixin, TitleMixin, SolvedProblemMixin, ListView
         )
 
         if self.request.profile:
-            context["organizations"] = self.request.profile.organizations.all()
+            context["organizations"] = self.request.profile.get_organizations()
         context["category"] = self.category
-        context["categories"] = ProblemGroup.objects.all()
+        context["categories"] = get_all_problem_groups()
         if self.show_types:
             context["selected_types"] = self.selected_types
-            context["problem_types"] = ProblemType.objects.all()
+            context["problem_types"] = get_all_problem_types()
         context["has_fts"] = settings.ENABLE_FTS
         context["org_query"] = self.org_query
         context["author_query"] = Profile.objects.filter(id__in=self.author_query)
         context["search_query"] = self.search_query
         context["completed_problem_ids"] = self.get_completed_problems()
         context["attempted_problems"] = self.get_attempted_problems()
-        context["last_attempted_problems"] = self.get_latest_attempted_problems(
-            15, context["problems"] if self.filter_organization else None
-        )
+        if self.org_query:
+            context["last_attempted_problems"] = self.get_latest_attempted_problems(
+                15, context["problems"]
+            )
         context["page_type"] = "list"
         context.update(self.get_sort_paginate_context())
         if not self.in_contest:
@@ -713,30 +686,41 @@ class ProblemList(QueryStringSortMixin, TitleMixin, SolvedProblemMixin, ListView
             )
             context["has_clarifications"] = False
 
-            if self.request.user.is_authenticated:
-                participation = self.request.profile.current_contest
-                if participation:
-                    clarifications = ContestProblemClarification.objects.filter(
-                        problem__in=participation.contest.contest_problems.all()
-                    )
-                    context["has_clarifications"] = clarifications.count() > 0
-                    context["clarifications"] = clarifications.order_by("-date")
-                    if participation.contest.is_editable_by(self.request.user):
-                        context["can_edit_contest"] = True
+            participation = self.request.profile.current_contest
+            clarifications = ContestProblemClarification.objects.filter(
+                problem__in=participation.contest.contest_problems.all()
+            )
+            context["has_clarifications"] = clarifications.count() > 0
+            context["clarifications"] = clarifications.order_by("-date")
+            context["current_contest"] = participation.contest
+            if participation.contest.is_editable_by(self.request.user):
+                context["can_edit_contest"] = True
 
-        context["page_prefix"] = None
-        context["page_suffix"] = suffix = (
-            ("?" + self.request.GET.urlencode()) if self.request.GET else ""
-        )
-        context["first_page_href"] = (self.first_page_href or ".") + suffix
+            # Get contest quizzes
+            contest_quiz_entries = (
+                participation.contest.contest_problems.filter(quiz__isnull=False)
+                .select_related("quiz")
+                .order_by("order")
+            )
+            context["contest_quizzes"] = contest_quiz_entries
+            context["has_contest_quizzes"] = contest_quiz_entries.exists()
+
         context["has_show_editorial_option"] = True
-        context["show_contest_mode"] = self.request.in_contest_mode
+
+        Problem.prefetch_cache_has_public_editorial(*context["problems"])
+        if context["show_types"]:
+            Problem.prefetch_cache_types_name(*context["problems"])
+
+        Problem.prefetch_cache_i18n_name(
+            self.request.LANGUAGE_CODE, *context["problems"]
+        )
+
+        context["problems"] = Problem.get_cached_instances(*context["problems"])
+
         return context
 
     def get_noui_slider_points(self):
-        points = sorted(
-            self.prepoint_queryset.values_list("points", flat=True).distinct()
-        )
+        points = get_distinct_problem_points()
         if not points:
             return 0, 0, {}
         if len(points) == 1:
@@ -842,17 +826,16 @@ class ProblemFeed(ProblemList, FeedView):
     title = _("Problem feed")
     feed_type = None
 
-    def get_recommended_problem_ids(self, queryset):
+    def get_recommended_problem_ids(self, problem_ids):
         user_id = self.request.profile.id
-        problem_ids = queryset.values_list("id", flat=True)
+
         rec_types = [
-            RecommendationType.CF_DOT,
-            RecommendationType.CF_COSINE,
-            RecommendationType.CF_TIME_DOT,
-            RecommendationType.CF_TIME_COSINE,
+            RecommendationType.TWO_TOWER,
+            RecommendationType.CF,
+            RecommendationType.CF_TIME,
             RecommendationType.HOT_PROBLEM,
         ]
-        limits = [100, 100, 100, 100, 20]
+        limits = [200, 100, 100, 20]
         shuffle = True
 
         allow_debug_type = (
@@ -872,54 +855,27 @@ class ProblemFeed(ProblemList, FeedView):
         )
 
     def get_queryset(self):
-        if self.feed_type == "volunteer":
-            self.hide_solved = 0
-            self.show_types = 1
         queryset = super(ProblemFeed, self).get_queryset()
 
-        user = self.request.profile
-
         if self.feed_type == "new":
-            return queryset.order_by("-date").add_i18n_name(self.request.LANGUAGE_CODE)
-        elif user and self.feed_type == "volunteer":
-            voted_problems = (
-                user.volunteer_problem_votes.values_list("problem", flat=True)
-                if not bool(self.search_query)
-                else []
-            )
-            if self.show_solved_only:
-                queryset = queryset.filter(
-                    id__in=Submission.objects.filter(
-                        user=self.profile, points=F("problem__points")
-                    ).values_list("problem__id", flat=True)
-                )
-            return (
-                queryset.exclude(id__in=voted_problems)
-                .order_by("?")
-                .add_i18n_name(self.request.LANGUAGE_CODE)
-            )
+            return queryset.order_by("-date").values_list("id", flat=True)
+
         if "search" in self.request.GET:
-            return queryset.add_i18n_name(self.request.LANGUAGE_CODE)
-        if not settings.ML_OUTPUT_PATH or not user:
-            return queryset.order_by("?").add_i18n_name(self.request.LANGUAGE_CODE)
+            return queryset.values_list("id", flat=True)
 
-        q = self.get_recommended_problem_ids(queryset)
+        if not getattr(settings, "USE_ML", False) or not self.request.profile:
+            return queryset.order_by("?").values_list("id", flat=True)
 
-        queryset = Problem.objects.filter(id__in=q)
-        queryset = queryset.add_i18n_name(self.request.LANGUAGE_CODE)
-
-        # Reorder results from database to correct positions
-        res = [None for _ in range(len(q))]
-        position_in_q = {i: idx for idx, i in enumerate(q)}
-        for problem in queryset:
-            res[position_in_q[problem.id]] = problem
-        return res
+        return self.get_recommended_problem_ids(queryset.values_list("id", flat=True))
 
     def get_feed_context(self, object_list):
+        Problem.prefetch_cache_description(self.request.LANGUAGE_CODE, *object_list)
+
         return {
             "completed_problem_ids": self.get_completed_problems(),
             "attempted_problems": self.get_attempted_problems(),
             "show_types": self.show_types,
+            "problems": Problem.get_cached_instances(*object_list),
         }
 
     def get_context_data(self, **kwargs):
@@ -929,11 +885,12 @@ class ProblemFeed(ProblemList, FeedView):
         context["feed_type"] = self.feed_type
         context["has_show_editorial_option"] = False
 
+        problem_ids = [problem.id for problem in context["problems"]]
+        Problem.prefetch_cache_description(self.request.LANGUAGE_CODE, *problem_ids)
+
         return context
 
     def get(self, request, *args, **kwargs):
-        if request.in_contest_mode:
-            return HttpResponseRedirect(reverse("problem_list"))
         return super(ProblemFeed, self).get(request, *args, **kwargs)
 
 
@@ -961,26 +918,42 @@ class RandomProblem(ProblemList):
     def get(self, request, *args, **kwargs):
         self.setup_problem_list(request)
 
-        try:
-            return super().get(request, *args, **kwargs)
-        except ProgrammingError as e:
-            return generic_message(request, "FTS syntax error", e.args[1], status=400)
-
         if self.in_contest:
             raise Http404()
 
-        queryset = self.get_normal_queryset()
-        count = queryset.count()
+        try:
+            problem_ids = self.get_normal_queryset()
+            count = problem_ids.count()
+        except ProgrammingError as e:
+            return generic_message(request, "FTS syntax error", e.args[1], status=400)
+
         if not count:
+            query_string = request.META.get("QUERY_STRING", "")
             return HttpResponseRedirect(
                 "%s%s%s"
                 % (
                     reverse("problem_list"),
-                    request.META["QUERY_STRING"] and "?",
-                    request.META["QUERY_STRING"],
+                    query_string and "?",
+                    query_string,
                 )
             )
-        return HttpResponseRedirect(queryset[randrange(count)].get_absolute_url())
+
+        # Get a random problem ID and fetch the Problem object
+        random_problem_id = problem_ids[randrange(count)]
+        try:
+            problem = Problem.objects.get(id=random_problem_id)
+            return HttpResponseRedirect(problem.get_absolute_url())
+        except Problem.DoesNotExist:
+            # Fallback to problem list if the problem was deleted between queries
+            query_string = request.META.get("QUERY_STRING", "")
+            return HttpResponseRedirect(
+                "%s%s%s"
+                % (
+                    reverse("problem_list"),
+                    query_string and "?",
+                    query_string,
+                )
+            )
 
 
 user_logger = logging.getLogger("judge.user")
@@ -1203,9 +1176,11 @@ def problem_submit(request, problem, submission=None):
             "ACE_URL": settings.ACE_URL,
             "default_lang": default_lang,
             "problem_id": problem.id,
-            "output_only": problem.data_files.output_only
-            if hasattr(problem, "data_files")
-            else False,
+            "output_only": (
+                problem.data_files.output_only
+                if hasattr(problem, "data_files")
+                else False
+            ),
             "next_valid_submit_time": next_valid_submit_time,
         },
     )
@@ -1219,6 +1194,18 @@ class ProblemClone(
     form_class = ProblemCloneForm
     permission_required = "judge.clone_problem"
 
+    def has_permission(self):
+        if not self.request.user.is_authenticated:
+            return False
+
+        # Ensure the user has clone_problem permission
+        if not self.request.user.has_perm("judge.clone_problem"):
+            return False
+
+        # Additional checks to ensure problem is accessible
+        problem = self.get_object()
+        return problem.is_accessible_by(self.request.user)
+
     def form_valid(self, form):
         languages = self.object.allowed_languages.all()
         language_limits = self.object.language_limits.all()
@@ -1231,6 +1218,7 @@ class ProblemClone(
         problem.ac_rate = 0
         problem.user_count = 0
         problem.code = form.cleaned_data["code"]
+        problem._bypass_points_cap = self.request.user.is_superuser
         problem.save(should_move_data=False)
         problem.authors.add(self.request.profile)
         problem.allowed_languages.set(languages)
@@ -1239,4 +1227,1075 @@ class ProblemClone(
 
         return HttpResponseRedirect(
             reverse("admin:judge_problem_change", args=(problem.id,))
+        )
+
+
+class ProblemEdit(
+    ProblemMixin, PermissionRequiredMixin, TitleMixin, SingleObjectFormView
+):
+    title = _("Edit Problem")
+    template_name = "problem/edit.html"
+    form_class = ProblemEditForm
+
+    def get_title(self):
+        return _("Edit {0}").format(self.object.name)
+
+    def get_content_title(self):
+        return mark_safe(
+            escape(_("Editing problem for %s"))
+            % (
+                format_html(
+                    '<a href="{1}">{0}</a>',
+                    self.object.name,
+                    reverse("problem_detail", args=[self.object.code]),
+                )
+            )
+        )
+
+    def has_permission(self):
+        if not self.request.user.is_authenticated:
+            return False
+
+        problem = self.get_object()
+        return problem.is_editable_by(self.request.user)
+
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        # Add the instance to form kwargs (since SingleObjectFormView doesn't include ModelFormMixin)
+        if hasattr(self, "object"):
+            kwargs.update({"instance": self.object})
+
+        # Pass the user to the form for validation
+        kwargs["user"] = self.request.user
+        # Pass profile for DirectUploadFormMixin
+        kwargs["profile"] = self.request.profile
+
+        # Set initial memory unit based on current memory_limit
+        if self.object and self.object.memory_limit:
+            # If memory is divisible by 1024, show in MB
+            if self.object.memory_limit % 1024 == 0:
+                kwargs.setdefault("initial", {})
+                kwargs["initial"]["memory_unit"] = "MB"
+                kwargs["initial"]["memory_limit"] = self.object.memory_limit // 1024
+            else:
+                kwargs.setdefault("initial", {})
+                kwargs["initial"]["memory_unit"] = "KB"
+        return kwargs
+
+    def form_valid(self, form):
+        with reversion.create_revision():
+            # Save the main form
+            problem = form.save(commit=False)
+
+            # Handle memory unit conversion (already done in clean method)
+            (
+                form.changed_data.remove("memory_unit")
+                if "memory_unit" in form.changed_data
+                else None
+            )
+
+            problem._bypass_points_cap = self.request.user.is_superuser
+            problem.save()
+            form.save_m2m()
+
+            reversion.set_user(self.request.user)
+
+        # Add the current user as a curator if they're not already an author/curator
+        if not problem.is_editor(self.request.profile):
+            problem.curators.add(self.request.profile)
+
+        # Rescore if necessary fields changed
+        if form.changed_data and any(
+            f in form.changed_data for f in ("is_public", "points", "partial")
+        ):
+            transaction.on_commit(rescore_problem.s(problem.id).delay)
+
+        # Redirect to refresh the page with updated data (POST-REDIRECT-GET pattern)
+        return HttpResponseRedirect(self.request.path)
+
+    def form_invalid(self, form):
+        """Handle invalid form with formsets"""
+        return self.render_to_response(self.get_context_data(form=form))
+
+    def post(self, request, *args, **kwargs):
+        """Handle POST requests - either AI tagging, markdown improvement, or regular form submission"""
+        self.object = self.get_object()
+
+        # Check if this is an AI tagging request
+        if request.POST.get("problem_tag") == "1":
+            return self.handle_problem_tag(request)
+
+        # Check if this is a markdown improvement request
+        if request.POST.get("improve_markdown") == "1":
+            return self.handle_improve_markdown(request)
+
+        # Otherwise, handle regular form submission
+        return super().post(request, *args, **kwargs)
+
+    def handle_problem_tag(self, request):
+        """Handle AI tagging request - dispatches async Celery task"""
+        try:
+            if not can_use_ai_features(request.user):
+                return JsonResponse({"success": False, "error": "Permission denied"})
+
+            problem_code = request.POST.get("problem_code")
+            if not problem_code:
+                return JsonResponse(
+                    {"success": False, "error": "Problem code is required"}
+                )
+
+            try:
+                problem = Problem.objects.get(code=problem_code)
+            except Problem.DoesNotExist:
+                return JsonResponse({"success": False, "error": "Problem not found"})
+            if not problem.is_editable_by(request.user):
+                return JsonResponse({"success": False, "error": "Permission denied"})
+
+            # Dispatch async Celery task
+            description = request.POST.get("description", "").strip()
+            task = tag_problem_task.delay(problem_code, description=description)
+
+            return JsonResponse(
+                {
+                    "success": True,
+                    "task_id": task.id,
+                    "status": "processing",
+                    "problem_code": problem.code,
+                }
+            )
+
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error in AI tagging: {e}")
+            return JsonResponse(
+                {"success": False, "error": "An unexpected error occurred"}
+            )
+
+    def handle_improve_markdown(self, request):
+        """Handle markdown improvement request - dispatches async Celery task"""
+        try:
+            if not can_use_ai_features(request.user):
+                return JsonResponse({"success": False, "error": "Permission denied"})
+
+            problem_code = request.POST.get("problem_code")
+            if not problem_code:
+                return JsonResponse(
+                    {"success": False, "error": "Problem code is required"}
+                )
+
+            try:
+                problem = Problem.objects.get(code=problem_code)
+            except Problem.DoesNotExist:
+                return JsonResponse({"success": False, "error": "Problem not found"})
+            if not problem.is_editable_by(request.user):
+                return JsonResponse({"success": False, "error": "Permission denied"})
+
+            # Get description from form (current editor content) or fall back to DB
+            description = request.POST.get("description", "").strip()
+
+            # Dispatch async Celery task
+            task = improve_markdown_task.delay(problem_code, description=description)
+
+            return JsonResponse(
+                {
+                    "success": True,
+                    "task_id": task.id,
+                    "status": "processing",
+                    "problem_code": problem.code,
+                }
+            )
+
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error in markdown improvement: {e}")
+            return JsonResponse(
+                {"success": False, "error": "An unexpected error occurred"}
+            )
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["problem"] = self.object
+
+        from judge.models.public_request import PublicRequest
+
+        try:
+            context["public_request"] = self.object.public_request
+        except PublicRequest.DoesNotExist:
+            context["public_request"] = None
+
+        # Flag for template: are critical fields restricted?
+        # Only lock when the problem is public to the whole site (not merely org-private).
+        context["is_restricted"] = (
+            self.object.is_public
+            and not self.object.is_organization_private
+            and not self.request.user.is_superuser
+        )
+
+        return context
+
+
+class ProblemLog(TitleMixin, ListView):
+    template_name = "problem/log.html"
+    context_object_name = "versions"
+    paginate_by = 50
+
+    def get_title(self):
+        return _("Edit history for %s") % self.problem.name
+
+    def get_content_title(self):
+        return mark_safe(
+            escape(_("Edit history for %s"))
+            % format_html(
+                '<a href="{1}">{0}</a>',
+                self.problem.name,
+                reverse("problem_detail", args=[self.problem.code]),
+            )
+        )
+
+    def get(self, request, *args, **kwargs):
+        self.problem = get_object_or_404(Problem, code=self.kwargs["problem"])
+        if not self.problem.is_editable_by(request.user):
+            raise Http404()
+        return super().get(request, *args, **kwargs)
+
+    def get_queryset(self):
+        # Problem versions
+        problem_versions = list(
+            Version.objects.get_for_object(self.problem)
+            .select_related("revision__user__profile")
+            .order_by("-revision__date_created")
+        )
+
+        # Solution versions
+        solutions = Solution.objects.filter(problem=self.problem)
+        solution_versions = []
+        for sol in solutions:
+            solution_versions.extend(
+                Version.objects.get_for_object(sol)
+                .select_related("revision__user__profile")
+                .order_by("-revision__date_created")
+            )
+
+        # Use raw serialized_data instead of field_dict, because field_dict
+        # deserializes through the live model and can mask actual changes
+        # Process problem versions
+        raw_fields = [self._get_raw_fields(v) for v in problem_versions]
+        self._name_cache = self._build_name_cache(raw_fields)
+
+        for i, version in enumerate(problem_versions):
+            version.object_type = "problem"
+            if i < len(problem_versions) - 1:
+                version.changes = self._compute_changes(
+                    raw_fields[i + 1], raw_fields[i]
+                )
+            else:
+                version.changes = []
+
+        # Process solution versions
+        sol_raw = [self._get_raw_fields(v) for v in solution_versions]
+        for i, version in enumerate(solution_versions):
+            version.object_type = "solution"
+            # Find previous version of the same solution object
+            prev_raw = None
+            for j in range(i + 1, len(solution_versions)):
+                if solution_versions[j].object_id == version.object_id:
+                    prev_raw = sol_raw[j]
+                    break
+            if prev_raw is not None:
+                version.changes = self._compute_changes(
+                    prev_raw, sol_raw[i], model=Solution
+                )
+            else:
+                version.changes = []
+
+        # ProblemData (test data) versions
+        test_data_versions = []
+        if hasattr(self.problem, "data_files"):
+            test_data_versions = list(
+                Version.objects.get_for_object(self.problem.data_files)
+                .select_related("revision__user__profile")
+                .order_by("-revision__date_created")
+            )
+            td_raw = [self._get_raw_fields(v) for v in test_data_versions]
+            for i, version in enumerate(test_data_versions):
+                version.object_type = "test_data"
+                if i < len(test_data_versions) - 1:
+                    version.changes = self._compute_changes(
+                        td_raw[i + 1], td_raw[i], model=ProblemData
+                    )
+                else:
+                    version.changes = []
+
+        # ProblemSolutionCode versions (grouped by revision)
+        solution_code_versions = []
+        sol_codes = ProblemSolutionCode.objects.filter(problem=self.problem)
+        seen_revisions = set()
+        for sc in sol_codes:
+            for version in (
+                Version.objects.get_for_object(sc)
+                .select_related("revision__user__profile")
+                .order_by("-revision__date_created")
+            ):
+                if version.revision_id not in seen_revisions:
+                    seen_revisions.add(version.revision_id)
+                    version.object_type = "solution_code"
+                    version.changes = []
+                    solution_code_versions.append(version)
+        solution_code_versions.sort(key=lambda v: v.revision.date_created, reverse=True)
+
+        # Merge and sort by date
+        all_versions = (
+            problem_versions
+            + solution_versions
+            + test_data_versions
+            + solution_code_versions
+        )
+        all_versions.sort(key=lambda v: v.revision.date_created, reverse=True)
+
+        return all_versions
+
+    @staticmethod
+    def _get_raw_fields(version):
+        try:
+            data = json.loads(version.serialized_data)
+            if data:
+                return data[0].get("fields", {})
+        except (json.JSONDecodeError, IndexError, KeyError):
+            pass
+        return {}
+
+    _TEXT_DIFF_FIELDS = {"description", "summary", "content", "generator_script"}
+
+    def _compute_changes(self, old_dict, new_dict, model=None):
+        if model is None:
+            model = Problem
+
+        changes = []
+        all_keys = set(old_dict.keys()) | set(new_dict.keys())
+        skip_fields = {"id", "ac_rate", "user_count", "problem"}
+
+        for key in sorted(all_keys):
+            if key in skip_fields:
+                continue
+            old_val = old_dict.get(key)
+            new_val = new_dict.get(key)
+            if old_val != new_val:
+                try:
+                    field = model._meta.get_field(key)
+                    label = str(field.verbose_name)
+                except Exception:
+                    label = key
+
+                change = {
+                    "field": label,
+                    "old": self._format_value(key, old_val),
+                    "new": self._format_value(key, new_val),
+                }
+
+                if key in self._TEXT_DIFF_FIELDS:
+                    old_text = str(old_val) if old_val else ""
+                    new_text = str(new_val) if new_val else ""
+                    change["old"] = old_text
+                    change["new"] = new_text
+                    old_lines = old_text.splitlines()
+                    new_lines = new_text.splitlines()
+                    diff_lines = list(
+                        difflib.unified_diff(old_lines, new_lines, lineterm="", n=2)
+                    )
+                    # Skip the --- / +++ / @@ headers
+                    change["diff_lines"] = [
+                        l
+                        for l in diff_lines
+                        if not l.startswith("---") and not l.startswith("+++")
+                    ]
+
+                changes.append(change)
+        return changes
+
+    # Map of field name -> (Model, display_field) for resolving IDs to names
+    _ID_FIELDS = {
+        "authors": ("judge.Profile", "user__username"),
+        "curators": ("judge.Profile", "user__username"),
+        "testers": ("judge.Profile", "user__username"),
+        "banned_users": ("judge.Profile", "user__username"),
+        "types": ("judge.ProblemType", "name"),
+        "allowed_languages": ("judge.Language", "name"),
+        "organizations": ("judge.Organization", "name"),
+        "group": ("judge.ProblemGroup", "name"),
+        "license": ("judge.License", "name"),
+    }
+
+    _PROFILE_FIELDS = {"authors", "curators", "testers", "banned_users"}
+
+    def _build_name_cache(self, raw_fields_list):
+        """Collect all IDs per field across all versions and resolve in bulk."""
+        # Collect all IDs per resolver key
+        ids_by_key = {}
+        for fields in raw_fields_list:
+            for key in self._ID_FIELDS:
+                val = fields.get(key)
+                if val is None:
+                    continue
+                if key not in ids_by_key:
+                    ids_by_key[key] = set()
+                if isinstance(val, list):
+                    ids_by_key[key].update(val)
+                else:
+                    ids_by_key[key].add(val)
+
+        # Resolve profile fields via cache (0 DB queries)
+        all_profile_ids = set()
+        for key in self._PROFILE_FIELDS:
+            all_profile_ids.update(ids_by_key.get(key, set()))
+
+        profile_name_map = {}
+        if all_profile_ids:
+            profiles = Profile.get_cached_instances(*all_profile_ids)
+            profile_name_map = {p.id: p.username for p in profiles}
+
+        cache = {}
+        for key, ids in ids_by_key.items():
+            if not ids:
+                continue
+            if key in self._PROFILE_FIELDS:
+                cache[key] = profile_name_map
+            else:
+                model_path, display_field = self._ID_FIELDS[key]
+                app, model_name = model_path.split(".")
+                Model = apps.get_model(app, model_name)
+                cache[key] = dict(
+                    Model.objects.filter(id__in=ids).values_list("id", display_field)
+                )
+        return cache
+
+    def _format_value(self, key, val):
+        if val is None:
+            return ""
+
+        name_map = self._name_cache.get(key)
+
+        if isinstance(val, list):
+            if name_map:
+                return ", ".join(name_map.get(i, str(i)) for i in val)
+            return ", ".join(str(v) for v in val)
+
+        if name_map and val:
+            return name_map.get(val, str(val))
+
+        if key == "memory_limit" and val:
+            val = int(val)
+            if val % 1024 == 0:
+                return "%d MB" % (val // 1024)
+            return "%d KB" % val
+
+        val_str = str(val)
+        if len(val_str) > 300:
+            return val_str[:300] + "..."
+        return val_str
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["problem"] = self.problem
+        context["page_prefix"] = "?page="
+        context["first_page_href"] = reverse("problem_log", args=[self.problem.code])
+        return context
+
+
+class ProblemAdd(PermissionRequiredMixin, CreateView):
+    title = _("Add Problem")
+    template_name = "problem/add.html"
+    form_class = ProblemAddForm
+    model = Problem
+
+    def has_permission(self):
+        if not self.request.user.is_authenticated:
+            return False
+
+        # Check if user is superuser or has explicit add problem permission
+        user = self.request.user
+        return user.is_superuser or user.has_perm("judge.add_problem")
+
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        kwargs["user"] = self.request.user
+        return kwargs
+
+    def form_valid(self, form):
+        """Handle valid form submission"""
+        problem = form.save()
+
+        # Set default values for new problem
+        if not problem.date:
+            problem.date = timezone.now()
+
+        problem._bypass_points_cap = self.request.user.is_superuser
+        problem.save()
+
+        # Add success message
+        messages.success(
+            self.request,
+            _("Problem '%(name)s' has been created successfully!")
+            % {"name": problem.name},
+        )
+
+        return HttpResponseRedirect(reverse("problem_detail", args=[problem.code]))
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["title"] = self.title
+        context["page_type"] = "add"
+        return context
+
+
+class ProblemEditLanguageLimits(
+    ProblemMixin,
+    PermissionRequiredMixin,
+    TitleMixin,
+    TemplateResponseMixin,
+    SingleObjectMixin,
+    View,
+):
+    """Manage language-specific limits for a problem"""
+
+    template_name = "problem/language_limits.html"
+
+    def get_title(self):
+        return _("Edit Language Limits - {0}").format(self.object.name)
+
+    def get_content_title(self):
+        return mark_safe(
+            escape(_("Editing language limits for %s"))
+            % (
+                format_html(
+                    '<a href="{1}">{0}</a>',
+                    self.object.name,
+                    reverse("problem_detail", args=[self.object.code]),
+                )
+            )
+        )
+
+    def has_permission(self):
+        if not self.request.user.is_authenticated:
+            return False
+
+        problem = self.get_object()
+        return problem.is_editable_by(self.request.user)
+
+    def _is_restricted(self):
+        """Check if language limits editing is restricted (site-public problem + non-superuser)."""
+        return (
+            self.object.is_public
+            and not self.object.is_organization_private
+            and not self.request.user.is_superuser
+        )
+
+    def get(self, request, *args, **kwargs):
+        self.object = self.get_object()
+        language_limits = self.object.language_limits.all().order_by("language__name")
+
+        # Create form for adding new language limit
+        form = LanguageLimitEditForm(problem=self.object, user=request.user)
+
+        return self.render_to_response(
+            {
+                "language_limits": language_limits,
+                "problem": self.object,
+                "form": form,
+                "title": self.get_title(),
+                "content_title": self.get_content_title(),
+                "is_restricted": self._is_restricted(),
+            }
+        )
+
+    def post(self, request, *args, **kwargs):
+        self.object = self.get_object()
+
+        # Block all modifications on public problems for non-superusers
+        if self._is_restricted():
+            return HttpResponseForbidden()
+
+        # Handle delete requests
+        if "delete_limit" in request.POST:
+            limit_id = request.POST.get("limit_id")
+            try:
+                limit = self.object.language_limits.get(id=limit_id)
+                limit.delete()
+            except LanguageLimit.DoesNotExist:
+                pass
+            return HttpResponseRedirect(
+                reverse("problem_edit_language_limits", args=[self.object.code])
+            )
+
+        # Handle add form submission
+        form = LanguageLimitEditForm(
+            request.POST, problem=self.object, user=request.user
+        )
+
+        if form.is_valid():
+            language_limit = form.save(commit=False)
+            language_limit.problem = self.object
+            language_limit.save()
+            return HttpResponseRedirect(
+                reverse("problem_edit_language_limits", args=[self.object.code])
+            )
+
+        # Form is invalid, redisplay with errors
+        language_limits = self.object.language_limits.all().order_by("language__name")
+        return self.render_to_response(
+            {
+                "language_limits": language_limits,
+                "problem": self.object,
+                "form": form,
+                "title": self.get_title(),
+                "content_title": self.get_content_title(),
+                "is_restricted": self._is_restricted(),
+            }
+        )
+
+
+class ProblemEditLanguageTemplates(
+    ProblemMixin,
+    PermissionRequiredMixin,
+    TitleMixin,
+    TemplateResponseMixin,
+    SingleObjectMixin,
+    View,
+):
+    """Manage language templates for a problem"""
+
+    template_name = "problem/language_templates.html"
+
+    def get_title(self):
+        return _("Edit Language Templates - {0}").format(self.object.name)
+
+    def get_content_title(self):
+        return mark_safe(
+            escape(_("Editing language templates for %s"))
+            % (
+                format_html(
+                    '<a href="{1}">{0}</a>',
+                    self.object.name,
+                    reverse("problem_detail", args=[self.object.code]),
+                )
+            )
+        )
+
+    def has_permission(self):
+        if not self.request.user.is_authenticated:
+            return False
+
+        problem = self.get_object()
+        return problem.is_editable_by(self.request.user)
+
+    def get(self, request, *args, **kwargs):
+        self.object = self.get_object()
+        language_templates = self.object.language_templates.all().order_by(
+            "language__name"
+        )
+
+        # Create form for adding new language template
+        form = LanguageTemplateEditForm(problem=self.object)
+
+        return self.render_to_response(
+            {
+                "language_templates": language_templates,
+                "problem": self.object,
+                "form": form,
+                "title": self.get_title(),
+                "content_title": self.get_content_title(),
+                "ACE_URL": settings.ACE_URL,
+            }
+        )
+
+    def post(self, request, *args, **kwargs):
+        self.object = self.get_object()
+
+        # Handle delete requests
+        if "delete_template" in request.POST:
+            template_id = request.POST.get("template_id")
+            try:
+                template = self.object.language_templates.get(id=template_id)
+                template.delete()
+                messages.success(request, _("Language template deleted successfully."))
+            except LanguageTemplate.DoesNotExist:
+                messages.error(request, _("Language template not found."))
+            return HttpResponseRedirect(
+                reverse("problem_edit_language_templates", args=[self.object.code])
+            )
+
+        # Handle edit requests
+        if "edit_template" in request.POST:
+            template_id = request.POST.get("template_id")
+            try:
+                template = self.object.language_templates.get(id=template_id)
+                # Update the template directly without using form validation for simplicity
+                new_source = request.POST.get("source", "")
+                template.source = new_source
+                template.save()
+                messages.success(request, _("Language template updated successfully."))
+                return HttpResponseRedirect(
+                    reverse("problem_edit_language_templates", args=[self.object.code])
+                )
+            except LanguageTemplate.DoesNotExist:
+                messages.error(request, _("Language template not found."))
+                return HttpResponseRedirect(
+                    reverse("problem_edit_language_templates", args=[self.object.code])
+                )
+
+        # Handle add form submission
+        form = LanguageTemplateEditForm(request.POST, problem=self.object)
+
+        if form.is_valid():
+            language_template = form.save(commit=False)
+            language_template.problem = self.object
+            language_template.save()
+            messages.success(request, _("Language template added successfully."))
+            return HttpResponseRedirect(
+                reverse("problem_edit_language_templates", args=[self.object.code])
+            )
+
+        # Form is invalid, redisplay with errors
+        language_templates = self.object.language_templates.all().order_by(
+            "language__name"
+        )
+        return self.render_to_response(
+            {
+                "language_templates": language_templates,
+                "problem": self.object,
+                "form": form,
+                "title": self.get_title(),
+                "content_title": self.get_content_title(),
+                "ACE_URL": settings.ACE_URL,
+            }
+        )
+
+
+class ProblemEditSolutions(
+    ProblemMixin,
+    PermissionRequiredMixin,
+    TitleMixin,
+    TemplateResponseMixin,
+    SingleObjectMixin,
+    View,
+):
+    """Manage solutions for a problem"""
+
+    template_name = "problem/solutions.html"
+
+    def get_title(self):
+        return _("Edit Solutions - {0}").format(self.object.name)
+
+    def get_content_title(self):
+        return mark_safe(
+            escape(_("Editing solutions for %s"))
+            % (
+                format_html(
+                    '<a href="{1}">{0}</a>',
+                    self.object.name,
+                    reverse("problem_detail", args=[self.object.code]),
+                )
+            )
+        )
+
+    def has_permission(self):
+        if not self.request.user.is_authenticated:
+            return False
+
+        problem = self.get_object()
+        return problem.is_editable_by(self.request.user)
+
+    def get(self, request, *args, **kwargs):
+        self.object = self.get_object()
+        solutions = Solution.objects.filter(problem=self.object)
+        existing_solution = solutions.first() if solutions.exists() else None
+
+        # If there's an existing solution, create an edit form
+        if existing_solution:
+            form = ProblemSolutionEditForm(instance=existing_solution)
+        else:
+            form = ProblemSolutionEditForm()
+
+        return self.render_to_response(
+            {
+                "solutions": solutions,
+                "problem": self.object,
+                "form": form,
+                "existing_solution": existing_solution,
+                "title": self.get_title(),
+                "content_title": self.get_content_title(),
+            }
+        )
+
+    def post(self, request, *args, **kwargs):
+        self.object = self.get_object()
+
+        # Handle AJAX request for auto-generating solution
+        if "generate_solution" in request.POST:
+            return self.handle_generate_solution(request)
+
+        solutions = Solution.objects.filter(problem=self.object)
+        existing_solution = solutions.first() if solutions.exists() else None
+
+        # Handle delete requests
+        if "delete_solution" in request.POST:
+            solution_id = request.POST.get("solution_id")
+            try:
+                solution = Solution.objects.get(id=solution_id, problem=self.object)
+                solution.delete()
+
+                messages.success(request, _("Solution deleted successfully."))
+            except Solution.DoesNotExist:
+                messages.error(request, _("Solution not found."))
+            return HttpResponseRedirect(
+                reverse("problem_edit_solutions", args=[self.object.code])
+            )
+
+        # Handle add/edit form submission
+        if existing_solution:
+            # Edit existing solution
+            form = ProblemSolutionEditForm(request.POST, instance=existing_solution)
+            success_message = _("Solution updated successfully.")
+        else:
+            # Check if a solution was created while we were editing
+            if Solution.objects.filter(problem=self.object).exists():
+                messages.error(
+                    request, _("A solution already exists for this problem.")
+                )
+                return HttpResponseRedirect(
+                    reverse("problem_edit_solutions", args=[self.object.code])
+                )
+
+            # Add new solution
+            form = ProblemSolutionEditForm(request.POST)
+            success_message = _("Solution added successfully.")
+
+        if form.is_valid():
+            with reversion.create_revision():
+                solution = form.save(commit=False)
+                if not existing_solution:
+                    solution.problem = self.object
+                solution.save()
+                form.save_m2m()
+                reversion.set_user(request.user)
+
+            messages.success(request, success_message)
+            return HttpResponseRedirect(
+                reverse("problem_edit_solutions", args=[self.object.code])
+            )
+
+        # If form is invalid, show the page with errors
+        solutions = Solution.objects.filter(problem=self.object)
+        existing_solution = solutions.first() if solutions.exists() else None
+        return self.render_to_response(
+            {
+                "solutions": solutions,
+                "problem": self.object,
+                "form": form,
+                "existing_solution": existing_solution,
+                "title": self.get_title(),
+                "content_title": self.get_content_title(),
+            }
+        )
+
+    def handle_generate_solution(self, request):
+        """Handle AJAX request for auto-generating solution using LLM - dispatches async Celery task"""
+        if not can_use_ai_features(request.user):
+            return JsonResponse({"success": False, "error": "Permission denied"})
+
+        try:
+            problem = self.object
+            rough_ideas = request.POST.get("rough_ideas", "").strip()
+
+            # Dispatch async Celery task
+            task = generate_solution_task.delay(problem.code, rough_ideas)
+
+            return JsonResponse(
+                {
+                    "success": True,
+                    "task_id": task.id,
+                    "status": "processing",
+                    "problem_code": problem.code,
+                }
+            )
+
+        except Exception as e:
+            return JsonResponse({"success": False, "error": str(e)})
+
+
+class ProblemEditTranslations(
+    ProblemMixin,
+    PermissionRequiredMixin,
+    TitleMixin,
+    TemplateResponseMixin,
+    SingleObjectMixin,
+    View,
+):
+    """Manage translations for a problem"""
+
+    template_name = "problem/translations.html"
+
+    def get_title(self):
+        return _("Edit Translations - {0}").format(self.object.name)
+
+    def get_content_title(self):
+        return mark_safe(
+            escape(_("Editing translations for %s"))
+            % (
+                format_html(
+                    '<a href="{1}">{0}</a>',
+                    self.object.name,
+                    reverse("problem_detail", args=[self.object.code]),
+                )
+            )
+        )
+
+    def has_permission(self):
+        if not self.request.user.is_authenticated:
+            return False
+
+        problem = self.get_object()
+        return problem.is_editable_by(self.request.user)
+
+    def get(self, request, *args, **kwargs):
+        self.object = self.get_object()
+        translations = self.object.translations.all()
+        form = ProblemTranslationEditForm(prefix="add")
+
+        # Create individual forms for each existing translation
+        translation_forms = []
+        for translation in translations:
+            translation_form = ProblemTranslationEditForm(
+                instance=translation, prefix=f"edit_{translation.id}"
+            )
+            translation_forms.append(
+                {"translation": translation, "form": translation_form}
+            )
+
+        return self.render_to_response(
+            {
+                "translations": translations,
+                "translation_forms": translation_forms,
+                "problem": self.object,
+                "form": form,
+                "title": self.get_title(),
+                "content_title": self.get_content_title(),
+            }
+        )
+
+    def post(self, request, *args, **kwargs):
+        self.object = self.get_object()
+
+        # Handle delete requests
+        if "delete_translation" in request.POST:
+            translation_id = request.POST.get("translation_id")
+            try:
+                translation = self.object.translations.get(id=translation_id)
+                translation.delete()
+                messages.success(request, _("Translation deleted successfully."))
+            except ProblemTranslation.DoesNotExist:
+                messages.error(request, _("Translation not found."))
+            return HttpResponseRedirect(
+                reverse("problem_edit_translations", args=[self.object.code])
+            )
+
+        # Handle edit requests
+        if "edit_translation" in request.POST:
+            translation_id = request.POST.get("translation_id")
+            try:
+                translation = self.object.translations.get(id=translation_id)
+                prefix = f"edit_{translation.id}"
+
+                # Use Django's built-in prefix handling - pass the full POST data with prefix
+                form = ProblemTranslationEditForm(
+                    request.POST, instance=translation, prefix=prefix
+                )
+
+                if form.is_valid():
+                    form.save()
+                    messages.success(request, _("Translation updated successfully."))
+                    return HttpResponseRedirect(
+                        reverse("problem_edit_translations", args=[self.object.code])
+                    )
+                else:
+                    # If form has errors, render the page with errors
+                    translations = self.object.translations.all()
+                    translation_forms = []
+                    for trans in translations:
+                        if trans.id == translation.id:
+                            # Use the submitted form with errors for this translation
+                            translation_forms.append(
+                                {"translation": trans, "form": form}
+                            )
+                        else:
+                            # Create clean forms for other translations
+                            translation_forms.append(
+                                {
+                                    "translation": trans,
+                                    "form": ProblemTranslationEditForm(
+                                        instance=trans, prefix=f"edit_{trans.id}"
+                                    ),
+                                }
+                            )
+
+                    return self.render_to_response(
+                        {
+                            "translations": translations,
+                            "translation_forms": translation_forms,
+                            "problem": self.object,
+                            "form": ProblemTranslationEditForm(prefix="add"),
+                            "title": self.get_title(),
+                            "content_title": self.get_content_title(),
+                        }
+                    )
+            except ProblemTranslation.DoesNotExist:
+                messages.error(request, _("Translation not found."))
+                return HttpResponseRedirect(
+                    reverse("problem_edit_translations", args=[self.object.code])
+                )
+
+        # Handle add form submission
+        form = ProblemTranslationEditForm(request.POST, prefix="add")
+        if form.is_valid():
+            # Check for duplicate language
+            language = form.cleaned_data["language"]
+            if self.object.translations.filter(language=language).exists():
+                messages.error(
+                    request, _("A translation for this language already exists.")
+                )
+                return HttpResponseRedirect(
+                    reverse("problem_edit_translations", args=[self.object.code])
+                )
+
+            translation = form.save(commit=False)
+            translation.problem = self.object
+            translation.save()
+            messages.success(request, _("Translation added successfully."))
+            return HttpResponseRedirect(
+                reverse("problem_edit_translations", args=[self.object.code])
+            )
+
+        # If form is invalid, show the page with errors
+        translations = self.object.translations.all()
+
+        # Create individual forms for each existing translation
+        translation_forms = []
+        for translation in translations:
+            translation_form = ProblemTranslationEditForm(
+                instance=translation, prefix=f"edit_{translation.id}"
+            )
+            translation_forms.append(
+                {"translation": translation, "form": translation_form}
+            )
+
+        # Keep the form with errors (it already has the prefix)
+
+        return self.render_to_response(
+            {
+                "translations": translations,
+                "translation_forms": translation_forms,
+                "problem": self.object,
+                "form": form,
+                "title": self.get_title(),
+                "content_title": self.get_content_title(),
+            }
         )

@@ -45,6 +45,9 @@
       $('#hide_organization_contests').click(function () {
         submitFormWithParams($form, "POST");
       });
+      $('#show_only_rated_contests').click(function () {
+        submitFormWithParams($form, "POST");
+      });
       $('#go').click(function() {
         submitFormWithParams($form, "GET");
       });
@@ -108,24 +111,24 @@
 
 {% macro contest_join(contest, request, is_past=False) %}
   {% if request.in_contest and request.participation.contest == contest %}
-    <button class="small" disabled>{{ _('In contest') }}</button>
+    <button class="action-btn" disabled>{{ _('In contest') }}</button>
   {% elif is_past %}
     <form action="{{ url('contest_join', contest.key) }}" method="post">
       {% csrf_token %}
-      <input type="submit" class="unselectable button full small"
-        value="{{ _('Virtual join') }}">
+      <input type="submit" class="action-btn full"
+             value="{{ _('Virtual join') }}">
     </form>
   {% elif request.profile.id in contest.editor_ids or request.profile.id in contest.tester_ids %}
     <form action="{{ url('contest_join', contest.key) }}" method="post">
       {% csrf_token %}
-      <input type="submit" class="unselectable button full small"
-        value="{{ _('Spectate') }}">
+      <input type="submit" class="action-btn full"
+             value="{{ _('Spectate') }}">
     </form>
   {% else %}
     <form action="{{ url('contest_join', contest.key) }}" method="post">
       {% csrf_token %}
-      <input type="submit" class="unselectable button full small join-warning"
-        value="{{ _('Join') }}">
+      <input type="submit" class="action-btn full join-warning"
+             value="{{ _('Join') }}">
     </form>
   {% endif %}
 {% endmacro %}
@@ -307,4 +310,5 @@
       <i> {{ _('There is no past contest.') }} </i>
     {% endif %}
   {% endif %}
+
 {% endblock %}

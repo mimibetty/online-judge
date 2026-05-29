@@ -1,6 +1,6 @@
 {% extends "common-content.html" %}
 
-{% set has_hidden_subtasks = request.in_contest_mode and request.participation.contest.format.has_hidden_subtasks %}
+{% set has_hidden_subtasks = request.in_contest and request.participation.contest.format.has_hidden_subtasks %}
 
 {% block content_media %}
   {% include "comments/media-css.html" %}
@@ -31,10 +31,6 @@
       min-width: 12.5em;
     }
 
-    #problem-types, #allowed-langs, #available-judges {
-      padding-top: 1em;
-    }
-
     .problem-info-entry {
       padding-top: 0.5em;
     }
@@ -54,7 +50,7 @@
 {% block content_js_media %}
   {% include "comments/media-js.html" %}
   {% include "actionbar/media-js.html" %}
-  {% if request.in_contest_mode %}
+  {% if request.in_contest %}
     <script type="text/javascript">
       window.register_contest_notification("{{url('contest_clarification_ajax', request.participation.contest.key)}}");
     </script>
@@ -64,9 +60,14 @@
       $('#pdf_button').click(async function(e) {
         e.preventDefault();
         if (!$('#raw_problem').attr('src')) {
-          $('#raw_problem').attr('src', '{{problem.code}}/raw')
+          $('#raw_problem').attr('src', "{{url('problem_raw', problem.code)}}");
           $('#raw_problem').on('load', function() {
             renderKatex(frames['raw_problem'].document);
+            // Auto-open all spoilers/details elements in the PDF view
+            const details = frames['raw_problem'].document.querySelectorAll('details');
+            details.forEach(function(detail) {
+              detail.open = true;
+            });
             setTimeout(() => {
               frames['raw_problem'].print();
             }, 500);
@@ -96,17 +97,22 @@
 {% block title_row %}
   <div class="problem-title">
     {% if request.user.is_authenticated and not has_hidden_subtasks %}
+      {% if request.in_contest and contest_problem %}
+        {% set my_subs_link = url('contest_user_submissions', request.profile.current_contest.contest.key, request.user.username, problem.code) %}
+      {% else %}
+        {% set my_subs_link = url('user_submissions', problem.code, request.user.username) %}
+      {% endif %}
       {% if problem.id in completed_problem_ids %}
-        <a href="{{ url('user_submissions', problem.code, request.user.username) }}">
-          {% if problem.is_public or request.in_contest_mode %}
+        <a href="{{ my_subs_link }}">
+          {% if problem.is_public or request.in_contest %}
             <i class="solved-problem-color title-state fa fa-check-circle"></i>
           {% else %}
             <i class="solved-problem-color title-state fa fa-lock"></i>
           {% endif %}
         </a>
       {% elif problem.id in attempted_problems %}
-        <a href="{{ url('user_submissions', problem.code, request.user.username) }}">
-          {% if problem.is_public or request.in_contest_mode %}
+        <a href="{{ my_subs_link }}">
+          {% if problem.is_public or request.in_contest %}
             <i class="attempted-problem-color title-state fa fa-minus-circle"></i>
           {% else %}
             <i class="attempted-problem-color title-state fa fa-lock"></i>
@@ -115,9 +121,9 @@
       {% endif %}
     {% endif %}
     <h2 class="title-row" style="display: inline-block">{{ title }}</h2>
-    {% if problem.is_organization_private %}
+    {% if problem.is_organization_private and not request.in_contest %}
       <span class="organization-tags">
-        {% for org in problem.organizations.all() %}
+        {% for org in problem.get_organizations() %}
           {% include "organization/tag.html" %}
         {% endfor %}
       </span>
@@ -141,10 +147,10 @@
 
 
 {% block info_float %}
-  {% if request.user.is_authenticated and request.in_contest_mode and submission_limit %}
+  {% if request.user.is_authenticated and request.in_contest and submission_limit %}
     {% if submissions_left > 0 %}
       <a href="{{ url('problem_submit', problem.code) }}">
-        <button class="btn-green btn btn-primary btn-block btn-round">
+        <button class="submit-btn btn-green btn btn-primary btn-block btn-round">
           <span>{{ _('Submit') }}</span>
           <div class="icon icon-round d-flex align-items-center justify-content-center">
             <i class="fa fa-paper-plane"></i>
@@ -159,7 +165,7 @@
         {% endtrans %}
       </div>
     {% else %}
-      <button class="btn btn-disabled btn-block btn-round">
+      <button class="submit-btn btn btn-disabled btn-block btn-round">
         <span>{{ _('Submit') }}</span>
         <div class="icon icon-round d-flex align-items-center justify-content-center">
           <i class="fa fa-paper-plane"></i>
@@ -169,7 +175,7 @@
     {% endif %}
   {% else %}
     <a href="{{ url('problem_submit', problem.code) }}">
-      <button class="btn-green btn btn-primary btn-block btn-round">
+      <button class="submit-btn btn-green btn btn-primary btn-block btn-round">
         <span>{{ _('Submit') }}</span>
         <div class="icon icon-round d-flex align-items-center justify-content-center">
           <i class="fa fa-paper-plane"></i>
@@ -180,24 +186,40 @@
 
   <hr style="padding-bottom: 0.3em">
 
-  {% if request.user.is_authenticated and has_submissions %}
+  {% if request.in_contest and contest_problem %}
+    {% set contest_key = request.profile.current_contest.contest.key %}
+    {% if request.user.is_authenticated and has_submissions %}
+      <div class="link-row">
+        <a href="{{ url('contest_user_submissions', contest_key, request.user.username, problem.code) }}">
+          <i class="fa fa-address-book"></i><span> {{ _('My submissions') }}</span>
+        </a>
+      </div>
+    {% endif %}
     <div class="link-row">
-      <a href="{{url('user_submissions', problem.code, request.user.username) }}">
-        <i class="fa fa-address-book"></i><span> {{ _('My submissions') }}</span>
+      <a href="{{ url('contest_submissions', contest_key) }}?user_filter=all&problem={{ problem.code }}">
+        <i class="fa fa-rectangle-list"></i><span> {{ _('All submissions') }}</span>
+      </a>
+    </div>
+  {% else %}
+    {% if request.user.is_authenticated and has_submissions %}
+      <div class="link-row">
+        <a href="{{ url('user_submissions', problem.code, request.user.username) }}">
+          <i class="fa fa-address-book"></i><span> {{ _('My submissions') }}</span>
+        </a>
+      </div>
+    {% endif %}
+    <div class="link-row">
+      <a href="{{ url('chronological_submissions', problem.code) }}">
+        <i class="fa fa-rectangle-list"></i><span> {{ _('All submissions') }}</span>
+      </a>
+    </div>
+    <div class="link-row">
+      <a href="{{ url('ranked_submissions', problem.code) }}">
+        <i class="fa fa-list-check"></i><span> {{ _('Best submissions') }}</span>
       </a>
     </div>
   {% endif %}
-  <div class="link-row">
-    <a href="{{ url('chronological_submissions', problem.code) }}">
-      <i class="fa fa-rectangle-list"></i><span> {{ _('All submissions') }}</span>
-    </a>
-  </div>
-  <div class="link-row">
-    <a href="{{ url('ranked_submissions', problem.code) }}">
-      <i class="fa fa-list-check"></i><span> {{ _('Best submissions') }}</span>
-    </a>
-  </div>
-  {% if editorial and editorial.is_public and not (request.user.is_authenticated and request.in_contest_mode) %}
+  {% if problem.has_public_editorial() and not request.in_contest %}
     <hr>
     <div class="link-row">
       <a href="{{ url('problem_editorial', problem.code) }}">
@@ -209,24 +231,17 @@
   {% if can_edit_problem %}
     <hr>
     <div class="link-row">
+      <a href="{{ url('problem_edit', problem.code) }}">
+        <i class="fa fa-edit"></i><span> {{ _('Edit problem') }}</span>
+      </a>
+    </div>
+    <div class="link-row">
       <a href="{{ url('problem_ticket_list', problem.code) }}">
         <i class="fa fa-clipboard-list"></i><span> {{ _('Manage tickets') }}
           {% if num_open_tickets %}<span class="badge">{{ num_open_tickets }}</span>{% endif %}
         </span>
       </a>
     </div>
-    <div class="link-row">
-      <a href="{{ url('admin:judge_problem_change', problem.id) }}">
-        <i class="fa fa-edit"></i><span> {{ _('Edit problem') }}</span>
-      </a>
-    </div>
-    {% if not problem.is_manually_managed %}
-      <div class="link-row">
-        <a href="{{ url('problem_data', problem.code) }}">
-          <i class="fa fa-database"></i><span> {{ _('Edit test data') }}</span>
-        </a>
-      </div>
-    {% endif %}
   {% elif request.user.is_authenticated and has_tickets %}
     <hr>
     <div class="link-row">
@@ -246,10 +261,16 @@
     </div>
   {% endif %}
 
-  {% if perms.judge.clone_problem %}
+  {% if request.user.is_superuser %}
     <div class="link-row">
       <a href="{{ url('problem_clone', problem.code) }}">
         <i class="fas fa-clone"></i><span> {{ _('Clone problem') }}</span>
+      </a>
+    </div>
+
+    <div class="link-row">
+      <a href="{{ url('admin:judge_problem_change', problem.id) }}">
+        <i class="fa fa-user-shield"></i><span> {{ _('Admin') }}</span>
       </a>
     </div>
   {% endif %}
@@ -302,15 +323,15 @@
 
   {% if not contest_problem or not contest_problem.contest.hide_problem_tags %}
     <div id="problem-types">
-      {% with types=problem.types_list %}
+      {% with types=problem.get_types_name() %}
         <div class="toggle closed unselectable">
-          <i class="fa fa-chevron-right"></i> {% trans trimmed count=problem.types_list|length %}
+          <i class="fa fa-chevron-right"></i> {% trans trimmed count=problem.get_types_name()|length %}
             Problem type
             {% pluralize count %}
             Problem types
           {% endtrans %}
         </div>
-        <div style="display:none" class="toggled">{{ problem.types_list|join(", ") }}</div>
+        <div style="display:none" class="toggled">{{ problem.get_types_name()|join(", ") }}</div>
       {% endwith %}
     </div>
   {% endif %}
@@ -333,7 +354,7 @@
       </div>
     </div>
   {% endif %}
-  {% if problem.is_editable_by(request.user) %}
+  {% if can_edit_problem %}
     <div id="available-judges">
       <div class="toggle closed" id="judge-toggle">
         <i class="fa fa-chevron-right"></i><span
@@ -402,17 +423,15 @@
       </span>
     </span>
 
-    <span>
+    <span class="info-block">
       <i class="fa fa-file"></i><span class="pi-name"> {{ _('Output:') }}</span>
       <span class="new-pi-value">{{ fileio_output or _('stdout') }}</span>
     </span>
   </div>
 
-  {% cache 86400 'problem_html' problem.id LANGUAGE_CODE %}
-    {{ description|markdown(lazy_load=True)|reference|str|safe }}
-  {% endcache %}
+  {{ problem.translated_description(LANGUAGE_CODE)|markdown(lazy_load=True)|reference|str|safe }}
 
-  {% if problem.pdf_description %}
+  {% if problem.get_pdf_description() %}
     <embed src="{{url('problem_pdf_description', problem.code)}}" width="100%" height="500" type="application/pdf">
   {% endif %}
 
@@ -424,6 +443,8 @@
       <div style="clear:both"></div>
     {% endif %}
   {% endwith %}
+
+  {% include "problem/attachment_section.html" %}
 {% endblock %}
 
 {% block post_description_end %}
@@ -437,7 +458,6 @@
     {%- else -%}
       {% set actionbar_report_url = url('new_problem_ticket', problem.code) %}
       {% include "actionbar/list.html" %}
-      <br>
     {%- endif -%}
   {% endif %}
 {% endblock %}
@@ -465,5 +485,6 @@
     </div>
   {% endif %}
   {% include "problem/related_problems.html" %}
+  {% include "problem/contest_list_sidebar.html" %}
   <iframe name="raw_problem" id="raw_problem"></iframe>
 {% endblock %}

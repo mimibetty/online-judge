@@ -1,20 +1,13 @@
-import itertools
 import json
-from datetime import datetime
-from operator import itemgetter
+from datetime import datetime, timezone as datetime_timezone
+from collections import defaultdict
 
+from django.core.cache import cache
 from django.conf import settings
 from django.contrib.auth import logout as auth_logout
 from django.contrib.auth.decorators import login_required
-from django.contrib.auth.models import Permission
 from django.contrib.auth.views import redirect_to_login
 from django.contrib.contenttypes.models import ContentType
-from django.db import transaction
-from django.db.models import Count, Max, Min
-from django.db.models.fields import DateField
-from django.db.models.functions import Cast, ExtractYear
-from judge.models.bookmark import MakeBookMark
-from django.forms import Form
 from django.http import (
     Http404,
     HttpResponseRedirect,
@@ -30,7 +23,6 @@ from django.utils.formats import date_format
 from django.utils.functional import cached_property
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext as _, gettext_lazy
-from django.views import View
 from django.views.generic import DetailView, ListView, TemplateView
 from django.template.loader import render_to_string
 from reversion import revisions
@@ -38,38 +30,41 @@ from reversion import revisions
 from judge.forms import UserForm, ProfileForm, ProfileInfoForm
 from judge.models import (
     Profile,
-    Rating,
-    Submission,
     Friend,
     ProfileInfo,
     BlogPost,
     Problem,
     Contest,
     Solution,
+    BestSubmission,
+)
+from judge.models.contest import get_global_rating_range
+from judge.models.submission import (
+    get_user_submission_dates,
+    get_user_min_submission_year,
 )
 from judge.performance_points import get_pp_breakdown
 from judge.ratings import rating_class, rating_progress
 from judge.tasks import import_users
 from judge.utils.problems import contest_completed_ids, user_completed_ids
-from judge.utils.ranker import ranker
+from judge.views.contests import compute_ranks
 from judge.utils.unicode import utf8text
+from judge.models.profile import get_rating_rank, get_points_rank, get_contribution_rank
 from judge.utils.users import (
-    get_rating_rank,
-    get_points_rank,
     get_awards,
     get_contest_ratings,
+    get_user_rating_stats,
 )
 from judge.utils.views import (
     QueryStringSortMixin,
     TitleMixin,
     generic_message,
-    SingleObjectFormView,
     DiggPaginatorMixin,
 )
 from judge.utils.infinite_paginator import InfinitePaginationMixin
-from judge.views.problem import ProblemList
-from .contests import ContestRanking
+from judge.utils.celery import redirect_to_task_status
 
+from .contests import ContestRanking
 
 __all__ = [
     "UserPage",
@@ -79,10 +74,6 @@ __all__ = [
     "users",
     "edit_profile",
 ]
-
-
-def remap_keys(iterable, mapping):
-    return [dict((mapping.get(k, k), v) for k, v in item.items()) for item in iterable]
 
 
 class UserMixin(object):
@@ -137,11 +128,7 @@ class UserPage(TitleMixin, UserMixin, DetailView):
 
     @cached_property
     def in_contest(self):
-        return (
-            self.profile is not None
-            and self.profile.current_contest is not None
-            and self.request.in_contest_mode
-        )
+        return False
 
     def get_completed_problems(self):
         if self.in_contest:
@@ -152,29 +139,23 @@ class UserPage(TitleMixin, UserMixin, DetailView):
     def get_context_data(self, **kwargs):
         context = super(UserPage, self).get_context_data(**kwargs)
 
-        context["followed"] = Friend.is_friend(self.request.profile, self.object)
+        context["followed"] = self.object.is_followed_by(self.request.profile)
         context["hide_solved"] = int(self.hide_solved)
         context["authored"] = self.object.authored_problems.filter(
             is_public=True, is_organization_private=False
         ).order_by("code")
 
-        rating = self.object.ratings.order_by("-contest__end_time")[:1]
-        context["rating"] = rating[0] if rating else None
-
         context["points_rank"] = get_points_rank(self.object)
 
-        if rating:
+        if self.object.rating:
             context["rating_rank"] = get_rating_rank(self.object)
-            context["rated_users"] = Profile.objects.filter(
-                is_unlisted=False, rating__isnull=False
-            ).count()
-        context.update(
-            self.object.ratings.aggregate(
-                min_rating=Min("rating"),
-                max_rating=Max("rating"),
-                contests=Count("contest"),
-            )
-        )
+
+        if self.object.contribution_points:
+            context["contribution_rank"] = get_contribution_rank(self.object)
+
+        user_rating_stats = get_user_rating_stats(self.object.id)
+        if user_rating_stats["min_rating"] is not None:
+            context.update(user_rating_stats)
         return context
 
     def get(self, request, *args, **kwargs):
@@ -186,7 +167,7 @@ class UserPage(TitleMixin, UserMixin, DetailView):
         return super(UserPage, self).get(request, *args, **kwargs)
 
 
-EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+EPOCH = datetime(1970, 1, 1, tzinfo=datetime_timezone.utc)
 
 
 class UserAboutPage(UserPage):
@@ -194,39 +175,44 @@ class UserAboutPage(UserPage):
 
     def get_context_data(self, **kwargs):
         context = super(UserAboutPage, self).get_context_data(**kwargs)
-        ratings = context["ratings"] = get_contest_ratings(self.object)
+        ratings = get_contest_ratings(self.object.id)
 
-        context["rating_data"] = mark_safe(
-            json.dumps(
-                [
-                    {
-                        "label": rating.contest.name,
-                        "rating": rating.rating,
-                        "ranking": rating.rank,
-                        "link": reverse("contest_ranking", args=(rating.contest.key,))
-                        + "#!"
-                        + self.object.username,
-                        "timestamp": (rating.contest.end_time - EPOCH).total_seconds()
-                        * 1000,
-                        "date": date_format(
-                            timezone.localtime(rating.contest.end_time),
-                            _("M j, Y, G:i"),
-                        ),
-                        "class": rating_class(rating.rating),
-                        "height": "%.3fem" % rating_progress(rating.rating),
-                    }
-                    for rating in ratings
-                ]
+        if ratings:
+            context["rating_data"] = mark_safe(
+                json.dumps(
+                    [
+                        {
+                            "label": rating["contest_name"],
+                            "rating": rating["rating"],
+                            "ranking": rating["rank"],
+                            "link": reverse(
+                                "contest_ranking", args=(rating["contest_key"],)
+                            )
+                            + "?user="
+                            + self.object.username,
+                            "timestamp": (
+                                rating["contest_end_time"] - EPOCH
+                            ).total_seconds()
+                            * 1000,
+                            "date": date_format(
+                                timezone.localtime(rating["contest_end_time"]),
+                                _("M j, Y, G:i"),
+                            ),
+                            "class": rating_class(rating["rating"]),
+                            "height": "%.3fem" % rating_progress(rating["rating"]),
+                        }
+                        for rating in ratings
+                    ]
+                )
             )
-        )
 
         context["awards"] = get_awards(self.object)
 
         if ratings:
-            user_data = self.object.ratings.aggregate(Min("rating"), Max("rating"))
-            global_data = Rating.objects.aggregate(Min("rating"), Max("rating"))
+            # Use cached global rating range
+            global_data = get_global_rating_range()
             min_ever, max_ever = global_data["rating__min"], global_data["rating__max"]
-            min_user, max_user = user_data["rating__min"], user_data["rating__max"]
+            min_user, max_user = context["min_rating"], context["max_rating"]
             delta = max_user - min_user
             ratio = (
                 (max_ever - max_user) / (max_ever - min_ever)
@@ -236,28 +222,16 @@ class UserAboutPage(UserPage):
             context["max_graph"] = max_user + ratio * delta
             context["min_graph"] = min_user + ratio * delta - delta
 
-        submissions = (
-            self.object.submission_set.annotate(date_only=Cast("date", DateField()))
-            .values("date_only")
-            .annotate(cnt=Count("id"))
-        )
+        # Use cached submission dates
+        submission_dates = get_user_submission_dates(self.object.id)
+        context["submission_data"] = mark_safe(json.dumps(submission_dates))
 
-        context["submission_data"] = mark_safe(
-            json.dumps(
-                {
-                    date_counts["date_only"].isoformat(): date_counts["cnt"]
-                    for date_counts in submissions
-                }
-            )
-        )
+        # Use cached min submission year
+        min_year = get_user_min_submission_year(self.object.id)
         context["submission_metadata"] = mark_safe(
             json.dumps(
                 {
-                    "min_year": (
-                        self.object.submission_set.annotate(
-                            year_only=ExtractYear("date")
-                        ).aggregate(min_year=Min("year_only"))["min_year"]
-                    ),
+                    "min_year": min_year,
                 }
             )
         )
@@ -271,47 +245,51 @@ class UserProblemsPage(UserPage):
     def get_context_data(self, **kwargs):
         context = super(UserProblemsPage, self).get_context_data(**kwargs)
 
-        result = (
-            Submission.objects.filter(
-                user=self.object,
-                points__gt=0,
-                problem__is_public=True,
-                problem__is_organization_private=False,
-            )
-            .exclude(
-                problem__in=self.get_completed_problems() if self.hide_solved else []
-            )
-            .values(
-                "problem__id",
-                "problem__code",
-                "problem__name",
-                "problem__points",
-                "problem__group__full_name",
-            )
-            .distinct()
-            .annotate(points=Max("points"))
-            .order_by("problem__group__full_name", "problem__code")
-        )
+        # Get best submissions using the BestSubmission cache table
+        best_subs = BestSubmission.objects.filter(
+            user=self.object,
+            points__gt=0,
+            problem__is_public=True,
+            problem__is_organization_private=False,
+        ).select_related("problem", "submission")
 
-        def process_group(group, problems_iter):
-            problems = list(problems_iter)
-            points = sum(map(itemgetter("points"), problems))
-            return {"name": group, "problems": problems, "points": points}
+        if self.hide_solved:
+            completed_problems = self.get_completed_problems()
+            best_subs = best_subs.exclude(problem__in=completed_problems)
+
+        # Build a mapping of problem_id to best submission data
+        problem_ids = []
+        best_sub_map = {}
+        for bs in best_subs:
+            problem_ids.append(bs.problem_id)
+            best_sub_map[bs.problem_id] = {
+                "points": bs.submission.points if bs.submission else bs.points,
+                "total": bs.problem.points,
+            }
+
+        problems = Problem.get_cached_instances(*problem_ids)
+
+        group_problems = defaultdict(list)
+        group_points = defaultdict(float)
+
+        for problem in problems:
+            if problem.id not in best_sub_map:
+                continue
+            sub_data = best_sub_map[problem.id]
+            group_name = problem.get_group_name()
+            # Create a dict-like object that template can access
+            problem_entry = {
+                "code": problem.code,
+                "name": problem.name,
+                "points": sub_data["points"],
+                "total": sub_data["total"],
+            }
+            group_problems[group_name].append(problem_entry)
+            group_points[group_name] += sub_data["points"] or 0
 
         context["best_submissions"] = [
-            process_group(group, problems)
-            for group, problems in itertools.groupby(
-                remap_keys(
-                    result,
-                    {
-                        "problem__code": "code",
-                        "problem__name": "name",
-                        "problem__points": "total",
-                        "problem__group__full_name": "group",
-                    },
-                ),
-                itemgetter("group"),
-            )
+            {"name": name, "problems": problems, "points": group_points[name]}
+            for name, problems in group_problems.items()
         ]
         breakdown, has_more = get_pp_breakdown(self.object, start=0, end=10)
         context["pp_breakdown"] = breakdown
@@ -323,10 +301,11 @@ class UserProblemsPage(UserPage):
 class UserBookMarkPage(DiggPaginatorMixin, ListView, UserPage):
     template_name = "user/user-bookmarks.html"
     context_object_name = "bookmarks"
-    paginate_by = 10
+    paginate_by = 20
 
     def get(self, request, *args, **kwargs):
         self.current_tab = self.request.GET.get("tab", "problems")
+        self.page = int(request.GET.get("page", 1))
         self.user = self.object = self.get_object()
         return super(UserBookMarkPage, self).get(request, *args, **kwargs)
 
@@ -341,17 +320,31 @@ class UserBookMarkPage(DiggPaginatorMixin, ListView, UserPage):
         else:
             model = Problem
 
-        q = MakeBookMark.objects.filter(user=self.user).select_related("bookmark")
-        q = q.filter(bookmark__content_type=ContentType.objects.get_for_model(model))
-        object_ids = q.values_list("bookmark__object_id", flat=True)
+        object_ids = self.user.bookmarked_objects.filter(
+            content_type=ContentType.objects.get_for_model(model)
+        ).values_list("object_id", flat=True)
 
-        res = model.objects.filter(id__in=object_ids)
+        queryset = model.objects.filter(id__in=object_ids)
         if self.current_tab == "contests":
-            res = res.prefetch_related("organizations", "tags")
+            queryset = queryset.prefetch_related("organizations", "tags")
         elif self.current_tab == "editorials":
-            res = res.select_related("problem")
+            queryset = queryset.select_related("problem")
 
-        return res
+        # Filter by accessibility with overfetching
+        user = self.request.user
+        needed_count = min(500, self.page * self.paginate_by * 2)
+        batch_size = needed_count * 2
+
+        result = []
+        for i in range(0, queryset.count(), batch_size):
+            batch = queryset[i : i + batch_size]
+            for obj in batch:
+                if obj.is_accessible_by(user):
+                    result.append(obj)
+                if len(result) >= needed_count:
+                    return result
+
+        return result
 
     def get_context_data(self, **kwargs):
         context = super(UserBookMarkPage, self).get_context_data(**kwargs)
@@ -402,7 +395,7 @@ def edit_profile(request):
     if request.method == "POST":
         form_user = UserForm(request.POST, instance=request.user)
         form = ProfileForm(
-            request.POST, request.FILES, instance=profile, user=request.user
+            request.POST, request.FILES, instance=profile, profile=request.profile
         )
         form_info = ProfileInfoForm(request.POST, instance=profile_info)
         if form_user.is_valid() and form.is_valid():
@@ -415,7 +408,7 @@ def edit_profile(request):
             return HttpResponseRedirect(request.path)
     else:
         form_user = UserForm(instance=request.user)
-        form = ProfileForm(instance=profile, user=request.user)
+        form = ProfileForm(instance=profile, profile=request.profile)
         form_info = ProfileInfoForm(instance=profile_info)
 
     tzmap = settings.TIMEZONE_MAP
@@ -441,14 +434,22 @@ class UserList(QueryStringSortMixin, InfinitePaginationMixin, TitleMixin, ListVi
     title = gettext_lazy("Leaderboard")
     context_object_name = "users"
     template_name = "user/list.html"
-    paginate_by = 100
-    all_sorts = frozenset(("points", "problem_count", "rating", "performance_points"))
+    paginate_by = 20
+    all_sorts = frozenset(
+        (
+            "points",
+            "problem_count",
+            "rating",
+            "performance_points",
+            "contribution_points",
+        )
+    )
     default_desc = all_sorts
     default_sort = "-performance_points"
     filter_friend = False
 
     def filter_friend_queryset(self, queryset):
-        friends = self.request.profile.get_friends()
+        friends = self.request.profile.get_following_ids(True)
         ret = queryset.filter(id__in=friends)
         return ret
 
@@ -457,12 +458,7 @@ class UserList(QueryStringSortMixin, InfinitePaginationMixin, TitleMixin, ListVi
             Profile.objects.filter(is_unlisted=False)
             .order_by(self.order, "id")
             .only(
-                "display_rank",
-                "points",
-                "rating",
-                "performance_points",
-                "problem_count",
-                "about",
+                "id",
             )
         )
         if self.request.organization:
@@ -474,10 +470,18 @@ class UserList(QueryStringSortMixin, InfinitePaginationMixin, TitleMixin, ListVi
 
     def get_context_data(self, **kwargs):
         context = super(UserList, self).get_context_data(**kwargs)
-        Profile.prefetch_profile_cache([u.id for u in context["users"]])
-        context["users"] = ranker(
-            context["users"], rank=self.paginate_by * (context["page_obj"].number - 1)
-        )
+        Profile.get_cached_instances(*[u.id for u in context["users"]])
+        Profile.prefetch_cache_about(*[u.id for u in context["users"]])
+        page_ids = {u.id for u in context["users"]}
+        if page_ids:
+            full_rows = self.object_list.values_list("id", "points")
+            rank_map = compute_ranks(
+                ((pid, points, 0, 0) for pid, points in full_rows),
+                target_ids=page_ids,
+            )
+            context["users"] = [(rank_map.get(u.id, 1), u) for u in context["users"]]
+        else:
+            context["users"] = []
         context["first_page_href"] = "."
         context["page_type"] = "friends" if self.filter_friend else "list"
         context.update(self.get_sort_context())
@@ -496,13 +500,6 @@ class FixedContestRanking(ContestRanking):
 
 
 def users(request):
-    if request.user.is_authenticated:
-        if request.in_contest_mode:
-            participation = request.profile.current_contest
-            contest = participation.contest
-            return FixedContestRanking.as_view(contest=contest)(
-                request, contest=contest.key
-            )
     return user_list_view(request)
 
 
@@ -522,14 +519,13 @@ def user_ranking_redirect(request):
     ).count()
     page = rank // UserList.paginate_by
     return HttpResponseRedirect(
-        "%s%s#!%s"
-        % (reverse("user_list"), "?page=%d" % (page + 1) if page else "", username)
+        "%s?page=%d&user=%s" % (reverse("user_list"), page + 1, username)
     )
 
 
 class UserLogoutView(TitleMixin, TemplateView):
     template_name = "registration/logout.html"
-    title = "You have been successfully logged out."
+    title = gettext_lazy("You have been successfully logged out.")
 
     def post(self, request, *args, **kwargs):
         auth_logout(request)
@@ -539,6 +535,13 @@ class UserLogoutView(TitleMixin, TemplateView):
 class ImportUsersView(TitleMixin, TemplateView):
     template_name = "user/import/index.html"
     title = _("Import Users")
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        if self.request.user.is_authenticated and self.request.user.is_superuser:
+            cache_key = f"import_users_log_{self.request.profile.id}"
+            context["import_log"] = cache.get(cache_key)
+        return context
 
     def get(self, *args, **kwargs):
         if self.request.user.is_superuser:
@@ -564,14 +567,31 @@ def import_users_post_file(request):
 
 
 def import_users_submit(request):
-    import json
-
     if not request.user.is_superuser or request.method != "POST":
         return HttpResponseForbidden()
 
-    users = json.loads(request.body)["users"]
-    log = import_users.import_users(users)
-    return JsonResponse({"msg": log})
+    try:
+        if "user_data" in request.POST:
+            users_data = json.loads(request.POST["user_data"])
+            users = users_data.get("users", [])
+            muted = users_data.get("muted", True)
+        else:
+            body = json.loads(request.body)
+            users = body["users"]
+            muted = body.get("muted", True)
+
+        status = import_users.import_users.delay(
+            users, profile_id=request.profile.id, muted=muted
+        )
+        cache.delete(f"import_users_log_{request.profile.id}")
+
+        return redirect_to_task_status(
+            status,
+            message=_("Importing users..."),
+            redirect=reverse("import_users"),
+        )
+    except (KeyError, json.JSONDecodeError) as e:
+        return HttpResponseBadRequest(f"Invalid request format: {e}")
 
 
 def sample_import_users(request):
@@ -602,5 +622,5 @@ def toggle_follow(request, user):
     if request.profile.id == profile_to_follow.id:
         raise Http404()
 
-    Friend.toggle_friend(request.profile, profile_to_follow)
+    Friend.toggle_follow(request.profile, profile_to_follow)
     return HttpResponseRedirect(reverse("user_page", args=(user,)))

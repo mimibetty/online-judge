@@ -7,21 +7,17 @@ from lxml import html
 
 
 class CompressorWidgetMixin(object):
-    __template_css = dedent(
-        """\
+    __template_css = dedent("""\
         {% compress css %}
             {{ media.css }}
         {% endcompress %}
-    """
-    )
+    """)
 
-    __template_js = dedent(
-        """\
+    __template_js = dedent("""\
         {% compress js %}
             {{ media.js }}
         {% endcompress %}
-    """
-    )
+    """)
 
     __templates = {
         (False, False): Template(""),
@@ -34,7 +30,7 @@ class CompressorWidgetMixin(object):
     compress_js = False
 
     try:
-        import compressor
+        pass
     except ImportError:
         pass
     else:
@@ -47,10 +43,14 @@ class CompressorWidgetMixin(object):
                 result = html.fromstring(template.render(Context({"media": media})))
 
                 return forms.Media(
-                    css={"all": [result.find(".//link").get("href")]}
-                    if self.compress_css
-                    else media._css,
-                    js=[result.find(".//script").get("src")]
-                    if self.compress_js
-                    else media._js,
+                    css=(
+                        {"all": [result.find(".//link").get("href")]}
+                        if self.compress_css
+                        else media._css
+                    ),
+                    js=(
+                        [result.find(".//script").get("src")]
+                        if self.compress_js
+                        else media._js
+                    ),
                 )

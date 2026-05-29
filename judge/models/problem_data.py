@@ -1,4 +1,3 @@
-import errno
 import os
 from zipfile import BadZipFile, ZipFile
 
@@ -14,7 +13,12 @@ __all__ = [
     "problem_directory_file",
     "ProblemData",
     "ProblemTestCase",
+    "ProblemSignatureGrader",
+    "ProblemValidation",
+    "ProblemValidationResult",
+    "ProblemSolutionCode",
     "CHECKERS",
+    "CSV_CHECKER_KEYS",
 ]
 
 problem_data_storage = ProblemDataStorage()
@@ -41,7 +45,24 @@ CHECKERS = (
     ("customcpp", _("Custom checker (CPP)")),
     ("interact", _("Interactive")),
     ("testlib", _("Testlib")),
+    ("testlibcms", _("Testlib (CMS / IOI)")),
+    ("interacttl", _("Interactive (Testlib)")),
+    ("csv_accuracy", _("CSV: accuracy")),
+    ("csv_rmse", _("CSV: RMSE")),
+    ("csv_mae", _("CSV: MAE")),
+    ("csv_f1", _("CSV: F1 (macro)")),
+    ("csv_auc", _("CSV: AUC (binary)")),
+    ("csv_logloss", _("CSV: log loss")),
 )
+
+CSV_CHECKER_KEYS = {
+    "csv_accuracy",
+    "csv_rmse",
+    "csv_mae",
+    "csv_f1",
+    "csv_auc",
+    "csv_logloss",
+}
 
 
 class ProblemData(models.Model):
@@ -65,6 +86,10 @@ class ProblemData(models.Model):
         blank=True,
         upload_to=problem_directory_file,
     )
+    generator_script = models.TextField(
+        verbose_name=_("generator script"),
+        blank=True,
+    )
     output_prefix = models.IntegerField(
         verbose_name=_("output prefix length"), blank=True, null=True
     )
@@ -75,7 +100,7 @@ class ProblemData(models.Model):
         verbose_name=_("init.yml generation feedback"), blank=True
     )
     checker = models.CharField(
-        max_length=10, verbose_name=_("checker"), choices=CHECKERS, blank=True
+        max_length=20, verbose_name=_("checker"), choices=CHECKERS, blank=True
     )
     checker_args = models.TextField(
         verbose_name=_("checker arguments"),
@@ -123,10 +148,67 @@ class ProblemData(models.Model):
         help_text=_("Support output-only problem"),
         null=True,
     )
+    binary_data = models.BooleanField(
+        verbose_name=_("binary answer data"),
+        help_text=_(
+            "Skip newline normalisation on answer files. Required when the "
+            "answer key or submission is binary (e.g. .npz / .npy / images)."
+        ),
+        null=True,
+        blank=True,
+    )
+    output_zip_size_mb = models.PositiveIntegerField(
+        verbose_name=_("output submission size limit (MB)"),
+        help_text=_(
+            "Maximum size in megabytes of the user's submission zip for "
+            "output-only problems. Defaults to 1 MB if unset."
+        ),
+        null=True,
+        blank=True,
+    )
     use_ioi_signature = models.BooleanField(
         verbose_name=_("is IOI signature"),
         help_text=_("Use IOI Signature"),
         null=True,
+    )
+    is_communication = models.BooleanField(
+        verbose_name=_("Is communication"),
+        help_text=_("IOI-style multi-process task with a manager."),
+        default=False,
+    )
+    communication_manager = models.FileField(
+        verbose_name=_("Manager"),
+        help_text=_("Manager source. Runs sandboxed, talks to user via FIFO."),
+        storage=problem_data_storage,
+        null=True,
+        blank=True,
+        upload_to=problem_directory_file,
+        validators=[FileExtensionValidator(allowed_extensions=["cpp", "c"])],
+    )
+    communication_num_processes = models.PositiveSmallIntegerField(
+        verbose_name=_("Num processes"),
+        help_text=_(
+            "Copies of the user's solution to launch (1 for callbacks, 2+ for multi-phase)."
+        ),
+        null=True,
+        blank=True,
+    )
+    testcase_validator = models.FileField(
+        verbose_name=_("testcase validator"),
+        storage=problem_data_storage,
+        null=True,
+        blank=True,
+        upload_to=problem_directory_file,
+        validators=[FileExtensionValidator(allowed_extensions=["cpp", "py"])],
+    )
+    testcase_validator_language = models.CharField(
+        max_length=10,
+        verbose_name=_("validator language"),
+        choices=(
+            ("cpp", _("C/C++")),
+            ("python", _("Python")),
+        ),
+        blank=True,
     )
     signature_handler = models.FileField(
         verbose_name=_("signature handler"),
@@ -156,12 +238,13 @@ class ProblemData(models.Model):
         if self.__original_zipfile:
             try:
                 files = ZipFile(self.__original_zipfile.path).namelist()
-                for file in files:
-                    cache_key = "problem_archive:%s:%s" % (
-                        self.problem.code,
-                        get_file_cachekey(file),
-                    )
-                    cache.delete(cache_key)
+                cache_keys = [
+                    "problem_archive:%s:%s"
+                    % (self.problem.code, get_file_cachekey(file))
+                    for file in files
+                ]
+                if cache_keys:
+                    cache.delete_many(cache_keys)
             except (BadZipFile, FileNotFoundError):
                 pass
             if self.zipfile != self.__original_zipfile:
@@ -202,6 +285,27 @@ class ProblemData(models.Model):
             self.signature_handler.name = problem_directory_file_helper(
                 new, self.signature_handler.name
             )
+        for grader in self.problem.signature_graders.all():
+            if grader.handler:
+                grader.handler.name = problem_directory_file_helper(
+                    new, grader.handler.name
+                )
+            if grader.header:
+                grader.header.name = problem_directory_file_helper(
+                    new, grader.header.name
+                )
+            grader.save()
+
+        if self.testcase_validator:
+            self.testcase_validator.name = problem_directory_file_helper(
+                new, self.testcase_validator.name
+            )
+
+        if self.communication_manager:
+            self.communication_manager.name = problem_directory_file_helper(
+                new, self.communication_manager.name
+            )
+
         self.save()
 
     _update_code.alters_data = True
@@ -214,6 +318,11 @@ class ProblemTestCase(models.Model):
         related_name="cases",
         on_delete=models.CASCADE,
     )
+    BATCH_SCORING_CHOICES = (
+        ("sum", _("Sum")),
+        ("min", _("Min")),
+    )
+
     order = models.IntegerField(verbose_name=_("case position"))
     type = models.CharField(
         max_length=1,
@@ -224,6 +333,18 @@ class ProblemTestCase(models.Model):
             ("E", _("Batch end")),
         ),
         default="C",
+    )
+    batch_scoring = models.CharField(
+        max_length=20,
+        verbose_name=_("batch scoring"),
+        choices=BATCH_SCORING_CHOICES,
+        default="sum",
+        help_text=_(
+            "How per-case scores aggregate into the batch score. "
+            "Only applies to Batch start (S) rows. "
+            "Sum: Σ(case_points) — with [0,…,0,1] weights this is all-or-nothing. "
+            "Min: min(case_fraction) × batch_points — use [1,…,1] weights."
+        ),
     )
     input_file = models.CharField(
         max_length=100, verbose_name=_("input file name"), blank=True
@@ -241,10 +362,132 @@ class ProblemTestCase(models.Model):
         verbose_name=_("output limit length"), blank=True, null=True
     )
     checker = models.CharField(
-        max_length=10, verbose_name=_("checker"), choices=CHECKERS, blank=True
+        max_length=20, verbose_name=_("checker"), choices=CHECKERS, blank=True
     )
     checker_args = models.TextField(
         verbose_name=_("checker arguments"),
         blank=True,
         help_text=_("checker arguments as a JSON object"),
     )
+
+
+class ProblemSignatureGrader(models.Model):
+    problem = models.ForeignKey(
+        "Problem",
+        related_name="signature_graders",
+        on_delete=models.CASCADE,
+    )
+    language = models.CharField(
+        max_length=10,
+        choices=(
+            ("c", "C/C++"),
+            ("java", "Java"),
+            ("python", "Python"),
+        ),
+        verbose_name=_("signature language"),
+    )
+    handler = models.FileField(
+        verbose_name=_("signature handler"),
+        storage=problem_data_storage,
+        upload_to=problem_directory_file,
+        validators=[
+            FileExtensionValidator(allowed_extensions=["cpp", "c", "java", "py"])
+        ],
+    )
+    header = models.FileField(
+        verbose_name=_("signature header"),
+        storage=problem_data_storage,
+        upload_to=problem_directory_file,
+        validators=[FileExtensionValidator(allowed_extensions=["h"])],
+        null=True,
+        blank=True,
+    )
+
+
+class ProblemValidation(models.Model):
+    problem = models.ForeignKey(
+        "Problem",
+        related_name="validations",
+        on_delete=models.CASCADE,
+    )
+    validate_id = models.CharField(max_length=36, unique=True, db_index=True)
+    user = models.ForeignKey(
+        "Profile",
+        on_delete=models.CASCADE,
+    )
+    status = models.CharField(
+        max_length=2,
+        default="P",
+        choices=(
+            ("P", _("Pending")),
+            ("V", _("Validating")),
+            ("D", _("Done")),
+            ("E", _("Error")),
+        ),
+    )
+    total_cases = models.IntegerField(default=0)
+    passed = models.BooleanField(null=True)
+    failed_count = models.IntegerField(default=0)
+    error = models.TextField(blank=True)
+    date = models.DateTimeField(auto_now_add=True)
+
+
+class ProblemValidationResult(models.Model):
+    validation = models.ForeignKey(
+        ProblemValidation,
+        related_name="results",
+        on_delete=models.CASCADE,
+    )
+    case = models.IntegerField()
+    batch = models.IntegerField(null=True)
+    status = models.CharField(max_length=10)
+    feedback = models.TextField(blank=True)
+
+    class Meta:
+        unique_together = ("validation", "case")
+
+
+class ProblemSolutionCode(models.Model):
+    EXPECTED_RESULT_CHOICES = (
+        ("AC", _("Accepted")),
+        ("WA", _("Wrong Answer")),
+        ("TLE", _("Time Limit Exceeded")),
+        ("MLE", _("Memory Limit Exceeded")),
+        ("RTE", _("Runtime Error")),
+        ("OLE", _("Output Limit Exceeded")),
+        ("IR", _("Invalid Return")),
+    )
+
+    problem = models.ForeignKey(
+        "Problem",
+        related_name="solution_codes",
+        on_delete=models.CASCADE,
+    )
+    order = models.IntegerField(verbose_name=_("display order"), default=0)
+    name = models.CharField(
+        max_length=128,
+        verbose_name=_("name"),
+        blank=True,
+        default="",
+    )
+    source_code = models.TextField(verbose_name=_("source code"), max_length=65536)
+    language = models.ForeignKey(
+        "Language",
+        verbose_name=_("language"),
+        on_delete=models.CASCADE,
+    )
+    expected_result = models.CharField(
+        max_length=3,
+        verbose_name=_("expected result"),
+        choices=EXPECTED_RESULT_CHOICES,
+    )
+    last_submission = models.ForeignKey(
+        "Submission",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+
+    class Meta:
+        ordering = ["order"]

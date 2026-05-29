@@ -8,24 +8,31 @@ from operator import itemgetter
 
 from django import db
 from django.conf import settings
+from django.core.cache import cache
 from django.utils import timezone
 from django.db.models import F
-from django.core.cache import cache
 
 from judge import event_poster as event
 from judge.bridge.base_handler import ZlibPacketHandler, proxy_list
 from judge.utils.problems import finished_submission
 from judge.models import (
+    Contest,
     Judge,
     Language,
     LanguageLimit,
     Problem,
+    ProblemTestCase,
+    ProblemValidation,
+    ProblemValidationResult,
     RuntimeVersion,
     Submission,
     SubmissionTestCase,
 )
 from judge.bridge.utils import VanishedSubmission
+
 from judge.caching import cache_wrapper
+from judge.tasks.submission import update_problem_stats, update_user_points
+from judge.utils.problem_data import notify_problem_authors
 
 logger = logging.getLogger("judge.bridge")
 json_log = logging.getLogger("judge.json.bridge")
@@ -63,9 +70,15 @@ class JudgeHandler(ZlibPacketHandler):
             "ping-response": self.on_ping_response,
             "supported-problems": self.on_supported_problems,
             "handshake": self.on_handshake,
+            "validate-begin": self.on_validate_begin,
+            "validate-case": self.on_validate_case,
+            "validate-end": self.on_validate_end,
+            "validate-error": self.on_validate_error,
         }
         self._working = False
         self._working_data = {}
+        self._validating = None
+        self._validating_problem = None
         self._no_response_job = None
         self.executors = {}
         self.problems = set()
@@ -76,6 +89,7 @@ class JudgeHandler(ZlibPacketHandler):
         self.batch_id = None
         self.in_batch = False
         self._stop_ping = threading.Event()
+        self._ping_thread_ref = None
         self._ping_average = deque(maxlen=6)  # 1 minute average, just like load
         self._time_delta = deque(maxlen=6)
 
@@ -94,7 +108,13 @@ class JudgeHandler(ZlibPacketHandler):
 
     def on_disconnect(self):
         self._stop_ping.set()
-        self.judges.remove(self)
+        if self._no_response_job:
+            self._no_response_job.cancel()
+            self._no_response_job = None
+
+        # remove() atomically cleans submission_map/validate_map and returns orphaned work
+        sub, working_data = self.judges.remove(self)
+
         if self.name is not None:
             self._disconnected()
         logger.info(
@@ -104,12 +124,27 @@ class JudgeHandler(ZlibPacketHandler):
         json_log.info(
             self._make_json_log(action="disconnect", info="judge disconnected")
         )
-        if self._working:
+        if self._validating:
+            logger.info("Judge disconnected during validation %s", self._validating)
+            try:
+                _ensure_connection()
+                ProblemValidation.objects.filter(validate_id=self._validating).update(
+                    status="E", error="Judge disconnected"
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to mark validation %s as error on disconnect",
+                    self._validating,
+                )
+        if sub is not None and working_data:
+            logger.info(
+                "Requeueing submission %d from disconnected judge %s", sub, self.name
+            )
             self.judges.judge(
-                self._working,
-                self._working_data["problem"],
-                self._working_data["language"],
-                self._working_data["source"],
+                sub,
+                working_data["problem"],
+                working_data["language"],
+                working_data["source"],
                 None,
                 0,
             )
@@ -259,7 +294,8 @@ class JudgeHandler(ZlibPacketHandler):
         self.send({"name": "handshake-success"})
         logger.info("Judge authenticated: %s (%s)", self.client_address, packet["id"])
         self.judges.register(self)
-        threading.Thread(target=self._ping_thread).start()
+        self._ping_thread_ref = threading.Thread(target=self._ping_thread, daemon=True)
+        self._ping_thread_ref.start()
         self._connected()
 
     def can_judge(self, problem, executor, judge_id=None):
@@ -363,6 +399,7 @@ class JudgeHandler(ZlibPacketHandler):
             "source": source,
         }
         self._no_response_job = threading.Timer(20, self._kill_if_no_response)
+        self._no_response_job.start()
         self.send(
             {
                 "name": "submission-request",
@@ -379,6 +416,18 @@ class JudgeHandler(ZlibPacketHandler):
                     "attempt-no": data.attempt_no,
                     "user": data.user_id,
                 },
+            }
+        )
+
+    def submit_validate(self, validate_id, problem_id):
+        self._working = True
+        self._validating = validate_id
+        self._validating_problem = problem_id
+        self.send(
+            {
+                "name": "validate-request",
+                "validate-id": validate_id,
+                "problem-id": problem_id,
             }
         )
 
@@ -541,27 +590,43 @@ class JudgeHandler(ZlibPacketHandler):
         total = 0
         status = 0
         status_codes = ["SC", "AC", "WA", "MLE", "TLE", "IR", "RTE", "OLE"]
-        batches = {}  # batch number: (points, total)
+        batches = {}  # batch number: [list of (case.points, case.total)]
 
         for case in SubmissionTestCase.objects.filter(submission=submission):
-            time += case.time
+            time = max(time, case.time)
             if not case.batch:
                 points += case.points
                 total += case.total
             else:
-                if case.batch in batches:
-                    batches[case.batch][0] += case.points
-                    batches[case.batch][1] += case.total
-                else:
-                    batches[case.batch] = [case.points, case.total]
+                batches.setdefault(case.batch, []).append((case.points, case.total))
             memory = max(memory, case.memory)
             i = status_codes.index(case.status)
             if i > status:
                 status = i
 
-        for i in batches:
-            points += batches[i][0]
-            total += batches[i][1]
+        # Determine which batches use min-scoring.
+        # SubmissionTestCase.batch is a sequential counter (1-indexed) assigned
+        # during judging, matching the Nth type="S" ProblemTestCase row by order.
+        # This mapping is correct for all fresh judgings; it could drift if
+        # ProblemTestCase rows are reordered after old submissions were graded.
+        min_batch_numbers = set(
+            i + 1
+            for i, scoring in enumerate(
+                ProblemTestCase.objects.filter(dataset=submission.problem, type="S")
+                .order_by("order")
+                .values_list("batch_scoring", flat=True)
+            )
+            if scoring == "min"
+        )
+
+        for batch_id, case_pairs in batches.items():
+            batch_total = sum(t for _, t in case_pairs)
+            if batch_id in min_batch_numbers and batch_total > 0:
+                min_fraction = min(p / t if t else 0.0 for p, t in case_pairs)
+                points += min_fraction * batch_total
+            else:
+                points += sum(p for p, _ in case_pairs)
+            total += batch_total
 
         points = points
         total = total
@@ -597,11 +662,19 @@ class JudgeHandler(ZlibPacketHandler):
             )
         )
 
-        submission.user._updating_stats_only = True
-        submission.user.calculate_points()
-        problem._updating_stats_only = True
-        problem.update_stats()
+        update_user_points.delay(submission.user_id)
+        update_problem_stats.delay(problem.id)
         submission.update_contest()
+
+        if (
+            submission.contest_object_id
+            and submission.contest_object.scoreboard_visibility
+            == Contest.SCOREBOARD_VISIBLE
+        ):
+            event.post(
+                "contest_%s" % submission.contest_object.key,
+                {"type": "ranking-update"},
+            )
 
         finished_submission(submission)
 
@@ -616,9 +689,6 @@ class JudgeHandler(ZlibPacketHandler):
                 "result": submission.result,
             },
         )
-        if hasattr(submission, "contest"):
-            participation = submission.contest.participation
-            event.post("contest_%d" % participation.contest_id, {"type": "update"})
         self._post_update_submission(submission.id, "grading-end", done=True)
 
     def on_compile_error(self, packet):
@@ -691,18 +761,13 @@ class JudgeHandler(ZlibPacketHandler):
             )
 
     def on_internal_error(self, packet):
-        try:
-            raise ValueError("\n\n" + packet["message"])
-        except ValueError:
-            logger.exception(
-                "Judge %s failed while handling submission %s",
-                self.name,
-                packet["submission-id"],
-            )
         self._free_self(packet)
 
         id = packet["submission-id"]
         self._update_internal_error_submission(id, packet["message"])
+
+        # Notify problem authors about judge internal error
+        self._notify_problem_authors_on_error(id, packet["message"])
 
     def _update_internal_error_submission(self, id, message):
         if Submission.objects.filter(id=id).update(
@@ -732,6 +797,48 @@ class JudgeHandler(ZlibPacketHandler):
                     finish=True,
                     result="IE",
                 )
+            )
+
+    def _notify_problem_authors_on_error(self, submission_id, error_message):
+        """
+        Notify problem authors when a judge internal error occurs during submission evaluation.
+        """
+        try:
+            submission = Submission.objects.select_related("problem").get(
+                id=submission_id
+            )
+            problem = submission.problem
+
+            # Create detailed error message
+            detailed_message = (
+                f"Judge internal error occurred during submission evaluation.\n"
+            )
+            detailed_message += f"Judge: {self.name}\n"
+            detailed_message += f"Submission ID: {submission_id}\n"
+            detailed_message += f"Error details:\n{error_message}"
+
+            # Notify problem authors with submission link
+            notify_problem_authors(
+                problem=problem,
+                error_message=detailed_message,
+                error_type="Judge Internal Error",
+                submission=submission,
+            )
+
+            logger.info(
+                "Notified problem authors for submission %s internal error",
+                submission_id,
+            )
+
+        except Submission.DoesNotExist:
+            logger.warning(
+                "Cannot notify authors: submission %s not found", submission_id
+            )
+        except Exception as e:
+            logger.exception(
+                "Failed to notify problem authors for submission %s: %s",
+                submission_id,
+                e,
             )
 
     def on_submission_terminated(self, packet):
@@ -883,6 +990,102 @@ class JudgeHandler(ZlibPacketHandler):
 
         SubmissionTestCase.objects.bulk_create(bulk_test_case_updates)
 
+        # Cache input/expected-output previews for generator-based problems
+        visible_len = getattr(settings, "TESTCASE_VISIBLE_LENGTH", 64)
+        for result in updates:
+            input_preview = result.get("input", "")
+            answer_preview = result.get("expected-output", "")
+            if input_preview or answer_preview:
+                if len(input_preview) > visible_len:
+                    input_preview = input_preview[:visible_len] + "..."
+                if len(answer_preview) > visible_len:
+                    answer_preview = answer_preview[:visible_len] + "..."
+                cache_key = "submission_testdata:%s:%s" % (id, result["position"])
+                cache.set(
+                    cache_key,
+                    {"input": input_preview, "answer": answer_preview},
+                    86400,
+                )
+
+    def on_validate_begin(self, packet):
+        _ensure_connection()
+        validate_id = packet["validate-id"]
+        ProblemValidation.objects.filter(validate_id=validate_id).update(
+            status="V", total_cases=packet["total-cases"]
+        )
+        event.post(
+            f"validate_{validate_id}",
+            {
+                "type": "validate-begin",
+                "total_cases": packet["total-cases"],
+            },
+        )
+
+    def on_validate_case(self, packet):
+        _ensure_connection()
+        validate_id = packet["validate-id"]
+        try:
+            validation = ProblemValidation.objects.get(validate_id=validate_id)
+            ProblemValidationResult.objects.create(
+                validation=validation,
+                case=packet["case"],
+                batch=packet["batch"],
+                status=packet["status"],
+                feedback=packet["feedback"],
+            )
+        except ProblemValidation.DoesNotExist:
+            logger.warning("Unknown validation: %s", validate_id)
+        event.post(
+            f"validate_{validate_id}",
+            {
+                "type": "validate-case",
+                "case": packet["case"],
+                "status": packet["status"],
+            },
+        )
+
+    def on_validate_end(self, packet):
+        _ensure_connection()
+        validate_id = packet["validate-id"]
+        ProblemValidation.objects.filter(validate_id=validate_id).update(
+            status="D",
+            passed=packet["passed"],
+            failed_count=packet["failed"],
+        )
+        event.post(
+            f"validate_{validate_id}",
+            {
+                "type": "validate-end",
+                "passed": packet["passed"],
+                "total": packet["total"],
+                "failed": packet["failed"],
+            },
+        )
+        self._free_self_validation()
+
+    def on_validate_error(self, packet):
+        _ensure_connection()
+        validate_id = packet["validate-id"]
+        ProblemValidation.objects.filter(validate_id=validate_id).update(
+            status="E", error=packet["error"]
+        )
+        event.post(
+            f"validate_{validate_id}",
+            {
+                "type": "validate-error",
+                "error": packet["error"],
+            },
+        )
+        self._free_self_validation()
+
+    def _free_self_validation(self):
+        """Release judge after validation completes."""
+        validate_id = self._validating
+        self._validating = None
+        self._validating_problem = None
+        self._working = False
+        self.judges.on_judge_free_validation(self, validate_id)
+
     def on_malformed(self, packet):
         logger.error("%s: Malformed packet: %s", self.name, packet)
         json_log.exception(
@@ -958,6 +1161,15 @@ class JudgeHandler(ZlibPacketHandler):
             )
 
     def on_cleanup(self):
+        self._stop_ping.set()
+        if self._no_response_job:
+            self._no_response_job.cancel()
+            self._no_response_job = None
+        if self._ping_thread_ref:
+            self._ping_thread_ref.join(timeout=5)
+            if self._ping_thread_ref.is_alive():
+                logger.warning("Ping thread did not exit cleanly for %s", self.name)
+            self._ping_thread_ref = None
         db.connection.close()
 
 

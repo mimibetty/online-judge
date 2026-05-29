@@ -4,37 +4,29 @@ from django.http import (
     HttpResponse,
     JsonResponse,
     HttpResponseBadRequest,
-    HttpResponsePermanentRedirect,
     HttpResponseRedirect,
 )
-from django.core.paginator import Paginator
-from django.core.exceptions import PermissionDenied
 from django.shortcuts import render
-from django.forms.models import model_to_dict
-from django.db.models import (
-    Case,
-    BooleanField,
-    When,
-    Q,
-    Subquery,
-    OuterRef,
-    Exists,
-    Count,
-    IntegerField,
-    F,
-    Max,
-)
-from django.db.models.functions import Coalesce
+from django.db.models import F
 from django.utils import timezone
 from django.contrib.auth.decorators import login_required
 from django.urls import reverse
 
 
 from judge import event_poster as event
-from judge.jinja2.gravatar import gravatar
-from judge.models import Friend
+from judge.caching import cache_wrapper
 
-from chat_box.models import Message, Profile, Room, UserRoom, Ignore, get_room_info
+from chat_box.models import (
+    Message,
+    Profile,
+    Room,
+    UserRoom,
+    Ignore,
+    ChatModerationLog,
+    get_ignored_user_ids,
+    get_user_room_list,
+    get_first_msg_id,
+)
 from chat_box.utils import encrypt_url, decrypt_url, encrypt_channel, get_unread_boxes
 
 from reversion import revisions
@@ -57,11 +49,10 @@ class ChatView(ListView):
         return self.messages
 
     def has_next(self):
-        try:
-            msg = Message.objects.filter(room=self.room_id).earliest("id")
-        except Exception as e:
+        msg_id = get_first_msg_id(self.room_id)
+        if not msg_id:
             return False
-        return msg not in self.messages
+        return Message(id=msg_id) not in self.messages
 
     def get(self, request, *args, **kwargs):
         request_room = kwargs["room_id"]
@@ -84,10 +75,10 @@ class ChatView(ListView):
             request_room = None
 
         self.room_id = request_room
-        self.messages = (
-            Message.objects.filter(hidden=False, room=self.room_id, id__lt=last_id)
-            .select_related("author")
-            .only("body", "time", "author__rating", "author__display_rank")[:page_size]
+        self.messages = list(
+            Message.objects.filter(hidden=False, room=self.room_id, id__lt=last_id)[
+                :page_size
+            ]
         )
         if not only_messages:
             return super().get(request, *args, **kwargs)
@@ -115,22 +106,51 @@ class ChatView(ListView):
         )
         context["chat_lobby_channel"] = encrypt_channel("chat_lobby")
         if self.room:
-            users_room = [self.room.user_one, self.room.user_two]
-            users_room.remove(self.request.profile)
-            context["other_user"] = users_room[0]
-            context["other_online"] = get_user_online_status(context["other_user"])
-            context["is_ignored"] = Ignore.is_ignored(
-                self.request.profile, context["other_user"]
-            )
+            users_room = self.room.get_users()
+            other_users = [u for u in users_room if u.id != self.request.profile.id]
+            if other_users:
+                context["other_user"] = other_users[0]
+                context["other_online"] = get_user_online_status(context["other_user"])
+                context["is_ignored"] = Ignore.is_ignored(
+                    self.request.profile, context["other_user"]
+                )
         else:
             context["online_count"] = get_online_count()
         context["message_template"] = {
-            "author": self.request.profile,
+            "author_id": self.request.profile.id,
             "id": "$id",
             "time": timezone.now(),
             "body": "$body",
         }
         return context
+
+
+def hide_lobby_message(message, is_automated=False, moderator=None):
+    """Hide a single lobby message and log the action."""
+    message.hidden = True
+    message.save(update_fields=["hidden"])
+    get_first_msg_id.dirty(None)
+    ChatModerationLog.log_action(
+        message=message,
+        action="hide",
+        is_automated=is_automated,
+        moderator=moderator,
+    )
+
+
+def mute_chat_user(message, is_automated=False, moderator=None):
+    """Mute a user: hide all their lobby messages and prevent future posting."""
+    message.author.mute = True
+    message.author.save(update_fields=["mute"])
+    Profile.dirty_cache(message.author_id)
+    Message.objects.filter(room=None, author=message.author).update(hidden=True)
+    get_first_msg_id.dirty(None)
+    ChatModerationLog.log_action(
+        message=message,
+        action="mute",
+        is_automated=is_automated,
+        moderator=moderator,
+    )
 
 
 def delete_message(request):
@@ -145,11 +165,48 @@ def delete_message(request):
     except:
         return HttpResponseBadRequest()
 
-    if not request.user.is_staff and request.profile != mess.author:
+    if (
+        not request.user.has_perm("judge.change_comment")
+        and request.profile != mess.author
+    ):
         return HttpResponseBadRequest()
+
+    room_id = mess.room_id
+
+    if not room_id and request.user.has_perm("judge.change_comment"):
+        # Lobby message deleted by staff — shared helper handles hide + cache + log
+        hide_lobby_message(mess, moderator=request.profile)
+        return JsonResponse(ret)
 
     mess.hidden = True
     mess.save()
+
+    get_first_msg_id.dirty(room_id)
+
+    # If deleting the last message, update room's last_msg_id
+    if room_id:
+        room = Room.objects.get(id=room_id)
+        if room.last_msg_id == messid:
+            # Find the new last visible message
+            new_last_msg = (
+                Message.objects.filter(room_id=room_id, hidden=False)
+                .order_by("-id")
+                .first()
+            )
+            room.last_msg_id = new_last_msg.id if new_last_msg else None
+            room.save(update_fields=["last_msg_id"])
+
+        # Dirty the room cache to update last_message in sidebar
+        Room.dirty_cache(room_id)
+
+        # Decrement unread_count for users who haven't seen this message yet
+        user_rooms = UserRoom.objects.filter(
+            room_id=room_id, last_seen__lt=mess.time, unread_count__gt=0
+        ).exclude(user=mess.author)
+        for user_room in user_rooms:
+            user_room.unread_count = max(0, user_room.unread_count - 1)
+            user_room.save(update_fields=["unread_count"])
+            get_unread_boxes.dirty(user_room.user)
 
     return JsonResponse(ret)
 
@@ -160,7 +217,7 @@ def mute_message(request):
     if request.method == "GET":
         return HttpResponseBadRequest()
 
-    if not request.user.is_staff:
+    if not request.user.has_perm("judge.change_comment"):
         return HttpResponseBadRequest()
 
     try:
@@ -172,15 +229,15 @@ def mute_message(request):
     with revisions.create_revision():
         revisions.set_comment(_("Mute chat") + ": " + mess.body)
         revisions.set_user(request.user)
-        mess.author.mute = True
-        mess.author.save()
-
-    Message.objects.filter(room=None, author=mess.author).update(hidden=True)
+        mute_chat_user(mess, moderator=request.profile)
 
     return JsonResponse(ret)
 
 
 def check_valid_message(request, room):
+    if request.in_contest and request.participation.contest.use_clarifications:
+        return False
+
     if not room and len(request.POST["body"]) > 200:
         return False
 
@@ -236,27 +293,42 @@ def post_message(request):
                 "tmp_id": request.POST.get("tmp_id"),
             },
         )
+        if not get_first_msg_id(None):
+            get_first_msg_id.dirty(None)
     else:
-        get_room_info.dirty(room.id)
-        room.last_msg_time = new_message.time
+        Room.dirty_cache(room.id)
+        room.last_msg_id = new_message.id
         room.save()
 
-        for user in room.users():
-            event.post(
-                encrypt_channel("chat_" + str(user.id)),
-                {
-                    "type": "private",
-                    "author_id": request.profile.id,
-                    "message": new_message.id,
-                    "room": room.id,
-                    "tmp_id": request.POST.get("tmp_id"),
-                },
-            )
-            if user != request.profile:
+        # Dirty the user room list cache for all users in the room
+        for user in room.get_users():
+            get_user_room_list.dirty(user.id)
+
+            event_data = {
+                "type": "private",
+                "author_id": request.profile.id,
+                "message": new_message.id,
+                "room": room.id,
+                "tmp_id": request.POST.get("tmp_id"),
+            }
+
+            if user.id != request.profile.id:
+                # Update unread count first, then include in event
                 UserRoom.objects.filter(user=user, room=room).update(
                     unread_count=F("unread_count") + 1
                 )
                 get_unread_boxes.dirty(user)
+                # Get the new unread count for this room
+                user_room = UserRoom.objects.filter(user=user, room=room).first()
+                if user_room:
+                    event_data["unread_count"] = user_room.unread_count
+                    # Include other user's ID for badge update
+                    event_data["other_user_id"] = request.profile.id
+
+            event.post(encrypt_channel("chat_" + str(user.id)), event_data)
+
+        if not get_first_msg_id(room.id):
+            get_first_msg_id.dirty(room.id)
 
     return JsonResponse(ret)
 
@@ -322,13 +394,14 @@ def update_last_seen(request, **kwargs):
     return JsonResponse({"msg": "updated"})
 
 
+@cache_wrapper(prefix="cgoc", timeout=120)
 def get_online_count():
     last_5_minutes = timezone.now() - timezone.timedelta(minutes=5)
     return Profile.objects.filter(last_access__gte=last_5_minutes).count()
 
 
-def get_user_online_status(user):
-    time_diff = timezone.now() - user.last_access
+def get_user_online_status(profile):
+    time_diff = timezone.now() - profile.get_last_access()
     is_online = time_diff <= timezone.timedelta(minutes=5)
     return is_online
 
@@ -343,7 +416,7 @@ def user_online_status_ajax(request):
         try:
             user_id = int(user_id)
             user = Profile.objects.get(id=user_id)
-        except Exception as e:
+        except Exception:
             return HttpResponseBadRequest()
 
         is_online = get_user_online_status(user)
@@ -369,12 +442,7 @@ def user_online_status_ajax(request):
 def get_online_status(profile, other_profile_ids, rooms=None):
     if not other_profile_ids:
         return None
-    Profile.prefetch_profile_cache(other_profile_ids)
-
-    joined_ids = ",".join([str(id) for id in other_profile_ids])
-    other_profiles = Profile.objects.raw(
-        f"SELECT * from judge_profile where id in ({joined_ids}) order by field(id,{joined_ids})"
-    )
+    other_profiles = Profile.get_cached_instances(*other_profile_ids)
     last_5_minutes = timezone.now() - timezone.timedelta(minutes=5)
     ret = []
     if rooms:
@@ -382,19 +450,30 @@ def get_online_status(profile, other_profile_ids, rooms=None):
         count = {}
         last_msg = {}
         room_of_user = {}
+
+        # Prefetch room info for all rooms
+        Room.prefetch_room_cache(rooms)
+
         for i in unread_count:
-            room = Room.objects.get(id=i["room"])
-            other_profile = room.other_user(profile)
-            count[other_profile.id] = i["unread_count"]
-        rooms = Room.objects.filter(id__in=rooms)
-        for room in rooms:
-            other_profile_id = room.other_user_id(profile)
-            last_msg[other_profile_id] = room.last_message_body()
-            room_of_user[other_profile_id] = room.id
+            room_id = i["room"]
+            room = Room(id=room_id)
+            # Find the other user in a two-person room
+            user_ids = room.get_user_ids()
+            if len(user_ids) == 2:
+                other_id = user_ids[0] if user_ids[1] == profile.id else user_ids[1]
+                count[other_id] = i["unread_count"]
+
+        for room_id in rooms:
+            room = Room(id=room_id)
+            user_ids = room.get_user_ids()
+            if len(user_ids) == 2:
+                other_id = user_ids[0] if user_ids[1] == profile.id else user_ids[1]
+                last_msg[other_id] = room.get_last_message()
+                room_of_user[other_id] = room_id
 
     for other_profile in other_profiles:
         is_online = False
-        if other_profile.last_access >= last_5_minutes:
+        if other_profile.get_last_access() >= last_5_minutes:
             is_online = True
         user_dict = {"user": other_profile, "is_online": is_online}
         if rooms:
@@ -413,37 +492,32 @@ def get_online_status(profile, other_profile_ids, rooms=None):
 def get_status_context(profile, include_ignored=False):
     if include_ignored:
         ignored_users = []
-        queryset = Profile.objects
     else:
-        ignored_users = list(
-            Ignore.get_ignored_users(profile).values_list("id", flat=True)
-        )
-        queryset = Profile.objects.exclude(id__in=ignored_users)
+        ignored_users = get_ignored_user_ids(profile)
 
-    last_5_minutes = timezone.now() - timezone.timedelta(minutes=5)
-    recent_profile = (
-        Room.objects.filter(Q(user_one=profile) | Q(user_two=profile))
-        .annotate(
-            other_user=Case(
-                When(user_one=profile, then="user_two"),
-                default="user_one",
-            ),
-        )
-        .filter(last_msg_time__isnull=False)
-        .exclude(other_user__in=ignored_users)
-        .order_by("-last_msg_time")
-        .values("other_user", "id")[:20]
-    )
+    # Get user's room list sorted by last_msg_time
+    user_rooms = get_user_room_list(profile.id)[:20]
 
-    recent_profile_ids = [str(i["other_user"]) for i in recent_profile]
-    recent_rooms = [int(i["id"]) for i in recent_profile]
-    Room.prefetch_room_cache(recent_rooms)
+    # Prefetch room info for all rooms
+    Room.prefetch_room_cache(user_rooms)
 
-    admin_list = (
-        queryset.filter(display_rank="admin")
-        .exclude(id__in=recent_profile_ids)
-        .values_list("id", flat=True)
-    )
+    # Get other users from rooms
+    recent_profile_ids = []
+    recent_rooms = []
+
+    for room_id in user_rooms:
+        other_user_id = Room(id=room_id).other_user_id(profile)
+        if other_user_id and other_user_id not in ignored_users:
+            recent_profile_ids.append(other_user_id)
+            recent_rooms.append(room_id)
+
+    admin_ids = [
+        i
+        for i in get_admin_ids()
+        if i not in ignored_users and i not in recent_profile_ids
+    ]
+
+    Profile.prefetch_cache_last_access(*(recent_profile_ids + admin_ids))
 
     return [
         {
@@ -452,7 +526,7 @@ def get_status_context(profile, include_ignored=False):
         },
         {
             "title": _("Admin"),
-            "user_list": get_online_status(profile, admin_list),
+            "user_list": get_online_status(profile, admin_ids),
         },
     ]
 
@@ -467,14 +541,6 @@ def online_status_ajax(request):
             "unread_count_lobby": get_unread_count(None, request.profile),
         },
     )
-
-
-@login_required
-def get_room(user_one, user_two):
-    if user_one.id > user_two.id:
-        user_one, user_two = user_two, user_one
-    room, created = Room.objects.get_or_create(user_one=user_one, user_two=user_two)
-    return room
 
 
 @login_required
@@ -499,13 +565,8 @@ def get_or_create_room(request):
 
     if not other_user or not user:
         return HttpResponseBadRequest()
-    # TODO: each user can only create <= 300 rooms
-    room = get_room(other_user, user)
-    for u in [other_user, user]:
-        user_room, created = UserRoom.objects.get_or_create(user=u, room=room)
-        if created:
-            user_room.last_seen = timezone.now()
-            user_room.save()
+
+    room = Room.get_or_create_room(other_user, user)
 
     room_url = reverse("chat", kwargs={"room_id": room.id})
     if request.method == "GET":
@@ -529,10 +590,10 @@ def get_unread_count(rooms, user):
         if not user_room:
             return 0
         last_seen = user_room.last_seen
+        max_lobby_count = 100
         res = (
             Message.objects.filter(room__isnull=True, time__gte=last_seen)
-            .exclude(author=user)
-            .exclude(hidden=True)
+            .exclude(author=user, hidden=True)[:max_lobby_count]
             .count()
         )
 
@@ -550,5 +611,13 @@ def toggle_ignore(request, **kwargs):
         return HttpResponseBadRequest()
 
     Ignore.toggle_ignore(request.profile, other_user)
+    get_unread_boxes.dirty(request.profile)
     next_url = request.GET.get("next", "/")
     return HttpResponseRedirect(next_url)
+
+
+@cache_wrapper(prefix="gai", timeout=24 * 60, expected_type=list)
+def get_admin_ids():
+    return list(
+        Profile.objects.filter(display_rank="admin").values_list("id", flat=True)
+    )

@@ -1,10 +1,12 @@
 import itertools
 import json
 
-from django.utils.http import urlquote
+from urllib.parse import quote
 from jinja2.ext import Extension
 from mptt.utils import get_cached_trees
 from statici18n.templatetags.statici18n import inlinei18n
+
+from django.conf import settings
 
 from judge.highlight_code import highlight_code
 from judge.user_translations import gettext
@@ -23,18 +25,22 @@ from . import (
     spaceless,
     timedelta,
     comment,
+    upload,
 )
 from . import registry
 
 registry.function("str", str)
 registry.filter("str", str)
 registry.filter("json", json.dumps)
+registry.filter("json_loads", json.loads)
 registry.filter("highlight", highlight_code)
-registry.filter("urlquote", urlquote)
+registry.filter("urlquote", quote)
 registry.filter("roundfloat", round)
 registry.function("inlinei18n", inlinei18n)
 registry.function("mptt_tree", get_cached_trees)
 registry.function("user_trans", gettext)
+registry.function("TESTCASE_VISIBLE_LENGTH", settings.TESTCASE_VISIBLE_LENGTH)
+registry.function("USE_ML_ENABLED", lambda: getattr(settings, "USE_ML", False))
 
 
 @registry.function

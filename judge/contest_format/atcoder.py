@@ -3,9 +3,7 @@ from datetime import timedelta
 from django.core.exceptions import ValidationError
 from django.db import connection
 from django.template.defaultfilters import floatformat
-from django.urls import reverse
 from django.utils.html import format_html
-from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy
 
 from judge.contest_format.default import DefaultContestFormat
@@ -48,10 +46,7 @@ class AtCoderContestFormat(DefaultContestFormat):
         self.config.update(config or {})
         self.contest = contest
 
-    def update_participation(self, participation):
-        cumtime = 0
-        penalty = 0
-        points = 0
+    def gather_results(self, participation):
         format_data = {}
 
         frozen_time = self.contest.end_time
@@ -92,28 +87,34 @@ class AtCoderContestFormat(DefaultContestFormat):
                     )
                     if score:
                         prev = subs.filter(submission__date__lte=time).count() - 1
-                        penalty += prev * self.config["penalty"] * 60
                     else:
                         # We should always display the penalty, even if the user has a score of 0
                         prev = subs.count()
                 else:
                     prev = 0
 
-                if score:
-                    cumtime = max(cumtime, dt)
-
                 format_data[str(prob)] = {"time": dt, "points": score, "penalty": prev}
-                points += score
 
-        self.handle_frozen_state(participation, format_data)
-        participation.cumtime = cumtime + penalty
-        participation.score = round(points, self.contest.points_precision)
-        participation.tiebreaker = 0
-        participation.format_data = format_data
-        participation.save()
+        return format_data
+
+    def compute_cumtime(self, format_data, entries=None):
+        cumtime = 0
+        penalty = 0
+        for key, entry in format_data.items():
+            if entries is not None and key not in entries:
+                continue
+            if entry.get("points", 0) > 0:
+                cumtime = max(cumtime, entry.get("time", 0))
+                if self.config["penalty"] and entry.get("penalty"):
+                    penalty += entry["penalty"] * self.config["penalty"] * 60
+        return cumtime + penalty
 
     def display_user_problem(self, participation, contest_problem, show_final=False):
-        format_data = (participation.format_data or {}).get(str(contest_problem.id))
+        if contest_problem.quiz_id:
+            format_key = f"quiz_{contest_problem.id}"
+        else:
+            format_key = str(contest_problem.id)
+        format_data = (participation.format_data or {}).get(format_key)
         if format_data:
             penalty = (
                 format_html(
@@ -123,31 +124,16 @@ class AtCoderContestFormat(DefaultContestFormat):
                 if format_data.get("penalty")
                 else ""
             )
-            return format_html(
-                '<td class="{state} problem-score-col"><a data-featherlight="{url}" href="#">{points}{penalty}<div class="solving-time">{time}</div></a></td>',
-                state=(
-                    (
-                        "pretest-"
-                        if self.contest.run_pretests_only
-                        and contest_problem.is_pretested
-                        else ""
-                    )
-                    + self.best_solution_state(
-                        format_data["points"], contest_problem.points
-                    )
-                    + (" frozen" if format_data.get("frozen") else "")
-                ),
-                url=reverse(
-                    "contest_user_submissions_ajax",
-                    args=[
-                        self.contest.key,
-                        participation.id,
-                        contest_problem.problem.code,
-                    ],
-                ),
+            return self.display_problem_cell(
+                participation,
+                contest_problem,
+                format_data,
                 points=floatformat(format_data["points"]),
-                penalty=penalty,
-                time=nice_repr(timedelta(seconds=format_data["time"]), "noday"),
+                extra=penalty,
+                time=nice_repr(
+                    timedelta(seconds=format_data["time"]), "noday-no-seconds"
+                ),
+                time_seconds=int(format_data["time"]),
             )
         else:
-            return mark_safe('<td class="problem-score-col"></td>')
+            return self.display_empty_cell(contest_problem)

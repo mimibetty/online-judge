@@ -1,15 +1,13 @@
 <li class="status-row" id="lobby_row">
   <div class="status-container">
-    <img loading="lazy" src="{{ static('icons/icon.svg') }}" style="height:32px">
+    <img loading="lazy" src="{{ static('icons/icon.svg') }}" class="status-pic lobby-icon">
   </div>
-  <span style="padding-left:0.5em">
-    <b>{{_('Lobby')}}</b>
-  </span>
-  <span class="spacer" style="display:flex;justify-content: flex-end;">
-    {% if unread_count_lobby and unread_count_lobby > 0 %}
-      <span class="unread-count" id="unread-count-lobby">{{unread_count_lobby}}</span>
-    {% endif %}
-  </span>
+  <div class="status-user">
+    <span class="status-username"><b>{{_('Lobby')}}</b></span>
+  </div>
+  {% if unread_count_lobby and unread_count_lobby > 0 %}
+    <span class="unread-count" id="unread-count-lobby">{{unread_count_lobby}}</span>
+  {% endif %}
 </li>
 {% for section in status_sections %}
   {% if section.user_list %}
@@ -20,35 +18,33 @@
       <hr/>
     </div>
     <ul class="status-list toggled">
-      {% for user in section.user_list %}
-        <li class="click_space status-row" id="click_space_{{user.user.id}}" value="{{user.url}}">
+      {% for user_dict in section.user_list %}
+        <li class="click_space status-row" id="click_space_{{user_dict.user.id}}" value="{{user_dict.url}}">
           <div class="status-container">
-            <img loading="lazy" src="{{ gravatar(user.user, 135) }}" class="status-pic user-img">
-            <svg style="position:absolute;" height="32" width="32">
-              <circle class="status-circle" fill="{{'green' if user.is_online else 'red'}}"/>
-            </svg>
+            <img loading="lazy" src="{{ gravatar(user_dict.user.id, 135) }}" class="status-pic user-img">
+            <span class="status-circle {{ 'online' if user_dict.is_online else 'offline' }}"></span>
           </div>
           <div class="status-user">
-            <span class="username {{ user.user.css_class }} wrapline">
-              {{ user.user.username }}
+            <span class="username {{ user_dict.user.css_class }} wrapline">
+              {{ user_dict.user.username }}
             </span>
-            {% if user.last_msg %}
-              <span class="status_last_message wrapline" {% if user.room %}id="last_msg-{{user.room}}"{% endif %}>
-                {{ user.last_msg }}
+            {% if user_dict.last_msg %}
+              <span class="status_last_message status-last-message wrapline" {% if user_dict.room %}id="last_msg-{{user_dict.room}}"{% endif %}>
+                {{ user_dict.last_msg }}
               </span>
             {% endif %}
           </div>
-          {% if user.unread_count and user.unread_count > 0 %}
-            <span class="unread-count" id="unread-count-{{user.user.id}}">
-              {{user.unread_count}}
+          {% if user_dict.unread_count and user_dict.unread_count > 0 %}
+            <span class="unread-count" id="unread-count-{{user_dict.user.id}}">
+              {{user_dict.unread_count}}
             </span>
           {% endif %}
-          <div style="margin-right: 0.3em; position: relative;">
+          <div class="setting-wrapper">
             <div class="control-button small setting-button">
               <i class="fa fa-ellipsis-h"></i>
             </div>
             <div class="setting-content">
-              <a href="{{url('toggle_ignore', user.user.id)}}" class="red">
+              <a href="{{url('toggle_ignore', user_dict.user.id)}}" class="red">
                 {{_('Ignore')}}
               </a>
             </div>
@@ -58,4 +54,3 @@
     </ul>
   {% endif %}
 {% endfor %}
-

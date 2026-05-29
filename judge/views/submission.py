@@ -1,10 +1,10 @@
-import os.path
 from operator import attrgetter
 
 from django.conf import settings
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
+from django.core.files.storage import default_storage
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.exceptions import PermissionDenied
 from django.db.models import Prefetch
@@ -42,15 +42,17 @@ from judge.models import (
     Profile,
     Submission,
 )
+from judge.models.contest import get_contest_problem_ids
 from judge.utils.problems import get_result_data
 from judge.utils.problem_data import get_problem_case
 from judge.utils.raw_sql import join_sql_subquery, use_straight_join
-from judge.utils.views import DiggPaginatorMixin
+from judge.utils.views import DiggPaginatorMixin, paginate_query_context
 from judge.utils.infinite_paginator import InfinitePaginationMixin
 from judge.utils.views import TitleMixin
 from judge.utils.timedelta import nice_repr
 from judge.views.contests import ContestMixin
 from judge.caching import cache_wrapper
+from judge.models.runtime import get_all_languages
 
 
 def submission_related(queryset):
@@ -83,9 +85,18 @@ class SubmissionMixin(object):
 
 
 class SubmissionDetailBase(LoginRequiredMixin, TitleMixin, SubmissionMixin, DetailView):
-    queryset = Submission.objects.select_related(
-        "language", "problem", "user", "contest_object"
-    ).defer("problem__description", "user__about", "contest_object__description")
+    queryset = (
+        Submission.objects.select_related(
+            "language",
+            "problem",
+            "user",
+            "contest_object",
+            "source",
+            "contest__problem",
+        )
+        .prefetch_related("test_cases")
+        .defer("problem__description", "user__about", "contest_object__description")
+    )
 
     def get_object(self, queryset=None):
         submission = super(SubmissionDetailBase, self).get_object(queryset)
@@ -124,6 +135,17 @@ def get_hidden_subtasks(request, submission):
     contest = submission.contest_object
     if contest and contest.is_editable_by(request.user):
         return set()
+    # Per-problem is_result_hidden: hide ALL batches
+    if contest:
+        try:
+            cp = submission.contest.problem
+            if cp.is_result_hidden:
+                all_batches = {
+                    c.batch for c in submission.test_cases.all() if c.batch is not None
+                }
+                return all_batches if all_batches else {-1}
+        except Exception:
+            pass
     if contest and contest.format.has_hidden_subtasks:
         try:
             return contest.format.get_hidden_subtasks().get(
@@ -134,31 +156,49 @@ def get_hidden_subtasks(request, submission):
     return set()
 
 
-def make_batch(batch, cases, include_cases=True):
-    result = {"id": batch}
+def make_batch(batch, cases, batch_scoring=None, include_cases=True):
+    result = {"id": batch, "scoring": batch_scoring}
     if include_cases:
         result["cases"] = cases
     if batch:
-        result["points"] = sum(map(attrgetter("points"), cases))
-        result["total"] = sum(map(attrgetter("total"), cases))
+        batch_total = sum(map(attrgetter("total"), cases))
+        if batch_scoring == "min" and batch_total > 0:
+            min_fraction = min(c.points / c.total if c.total else 0.0 for c in cases)
+            result["points"] = min_fraction * batch_total
+        else:
+            result["points"] = sum(map(attrgetter("points"), cases))
+        result["total"] = batch_total
         result["AC"] = abs(result["points"] - result["total"]) < 1e-5
 
     return result
 
 
 def group_test_cases(submission, hidden_subtasks, include_cases=True):
-    cases = submission.test_cases.exclude(batch__in=hidden_subtasks)
+    cases = [c for c in submission.test_cases.all() if c.batch not in hidden_subtasks]
+
+    # Map batch number (1-indexed) → batch_scoring, for display hints.
+    batch_scorings = {
+        i + 1: scoring
+        for i, scoring in enumerate(
+            ProblemTestCase.objects.filter(dataset=submission.problem, type="S")
+            .order_by("order")
+            .values_list("batch_scoring", flat=True)
+        )
+    }
+
     result = []
     buf = []
     last = None
     for case in cases:
         if case.batch != last and buf:
-            result.append(make_batch(last, buf, include_cases))
+            result.append(
+                make_batch(last, buf, batch_scorings.get(last), include_cases)
+            )
             buf = []
         buf.append(case)
         last = case.batch
     if buf:
-        result.append(make_batch(last, buf, include_cases))
+        result.append(make_batch(last, buf, batch_scorings.get(last), include_cases))
     return result
 
 
@@ -170,30 +210,62 @@ def get_cases_data(submission):
     if submission.is_pretested:
         testcases = testcases.filter(is_pretest=True)
 
+    submitted_cases = {c.case for c in submission.test_cases.all()}
+    if not submitted_cases:
+        return {}
+
+    # Only fetch files for type-C cases the submission actually ran.
     files = []
+    count = 0
     for case in testcases:
+        if case.type != "C":
+            continue
+        count += 1
+        if count not in submitted_cases:
+            continue
         if case.input_file:
             files.append(case.input_file)
         if case.output_file:
             files.append(case.output_file)
     case_data = get_problem_case(submission.problem, files)
 
+    # Build case list and identify which need generator cache fallback
     problem_data = {}
+    cases_needing_cache = []
     count = 0
     for case in testcases:
         if case.type != "C":
             continue
         count += 1
-        problem_data[count] = {
-            "input": case_data.get(case.input_file, "") if case.input_file else "",
-            "answer": case_data.get(case.output_file, "") if case.output_file else "",
-        }
+        if count not in submitted_cases:
+            continue
+        input_data = case_data.get(case.input_file, "") if case.input_file else ""
+        answer_data = case_data.get(case.output_file, "") if case.output_file else ""
+        problem_data[count] = {"input": input_data, "answer": answer_data}
+        if not input_data or not answer_data:
+            cases_needing_cache.append(count)
+
+    # Batch fetch cached preview data for generator-based cases
+    if cases_needing_cache:
+        cache_keys = [
+            "submission_testdata:%s:%s" % (submission.id, c)
+            for c in cases_needing_cache
+        ]
+        cached = cache.get_many(cache_keys)
+        for c in cases_needing_cache:
+            key = "submission_testdata:%s:%s" % (submission.id, c)
+            if key in cached:
+                if not problem_data[c]["input"]:
+                    problem_data[c]["input"] = cached[key].get("input", "")
+                if not problem_data[c]["answer"]:
+                    problem_data[c]["answer"] = cached[key].get("answer", "")
 
     return problem_data
 
 
 class SubmissionStatus(SubmissionDetailBase):
     template_name = "submission/status.html"
+    highlight_source = True
 
     def can_see_testcases(self):
         contest_submission = self.object.contest_or_none
@@ -225,18 +297,24 @@ class SubmissionStatus(SubmissionDetailBase):
         submission = self.object
 
         context["hidden_subtasks"] = get_hidden_subtasks(self.request, self.object)
+        context["is_result_hidden"] = False
+        contest_sub = submission.contest_or_none
+        if contest_sub and contest_sub.problem.is_result_hidden:
+            if not submission.contest_object.is_editable_by(self.request.user):
+                context["is_result_hidden"] = True
         context["last_msg"] = event.last()
         context["batches"] = group_test_cases(
             submission, context["hidden_subtasks"], True
         )
         context["time_limit"] = submission.problem.time_limit
         context["can_see_testcases"] = False
-        context["highlighted_source"] = highlight_code(
-            submission.source.source,
-            submission.language.pygments,
-            linenos=True,
-            title=submission.language,
-        )
+        if self.highlight_source:
+            context["highlighted_source"] = highlight_code(
+                submission.source.source,
+                submission.language.pygments,
+                linenos=False,
+                title=submission.language,
+            )
 
         if self.can_see_testcases():
             context["cases_data"] = get_cases_data(submission)
@@ -254,6 +332,7 @@ class SubmissionStatus(SubmissionDetailBase):
 
 class SubmissionTestCaseQuery(SubmissionStatus):
     template_name = "submission/status-testcases.html"
+    highlight_source = False
 
     def get(self, request, *args, **kwargs):
         if "id" not in request.GET or not request.GET["id"].isdigit():
@@ -287,13 +366,13 @@ def abort_submission(request, submission):
 class SubmissionsListBase(DiggPaginatorMixin, TitleMixin, ListView):
     model = Submission
     paginate_by = 50
+    limit_anonymous_pages = True
     show_problem = True
     title = gettext_lazy("All submissions")
     content_title = gettext_lazy("All submissions")
     page_type = "all_submissions_list"
     template_name = "submission/list.html"
     context_object_name = "submissions"
-    first_page_href = None
     include_frozen = False
     organization = None
 
@@ -310,15 +389,13 @@ class SubmissionsListBase(DiggPaginatorMixin, TitleMixin, ListView):
         pass
 
     def hide_contest_in_row(self):
-        return self.request.in_contest_mode
+        return self.in_contest
 
     @cached_property
     def in_contest(self):
-        return (
-            self.request.user.is_authenticated
-            and self.request.profile.current_contest is not None
-            and self.request.in_contest_mode
-        )
+        # Only True for contest-specific views (e.g. ContestSubmissions)
+        # General submission views should not filter by contest
+        return False
 
     @cached_property
     def contest(self):
@@ -417,11 +494,14 @@ class SubmissionsListBase(DiggPaginatorMixin, TitleMixin, ListView):
     def get_all_submissions_page(self):
         return reverse("all_submissions")
 
+    def get_user_submissions_url_template(self):
+        return reverse("all_user_submissions", kwargs={"user": "__username__"})
+
     def get_searchable_status_codes(self):
         all_statuses = list(Submission.RESULT)
         all_statuses.extend([i for i in Submission.STATUS if i not in all_statuses])
-        hidden_codes = ["SC", "D", "G"]
-        if not self.request.user.is_superuser and not self.request.user.is_staff:
+        hidden_codes = ["SC"]
+        if not self.request.user.is_staff:
             hidden_codes += ["IE"]
         return [(key, value) for key, value in all_statuses if key not in hidden_codes]
 
@@ -446,22 +526,20 @@ class SubmissionsListBase(DiggPaginatorMixin, TitleMixin, ListView):
 
     def get_context_data(self, **kwargs):
         context = super(SubmissionsListBase, self).get_context_data(**kwargs)
-        authenticated = self.request.user.is_authenticated
         context["dynamic_update"] = False
         context["show_problem"] = self.show_problem
         context["profile"] = self.request.profile
-        context["all_languages"] = Language.objects.all().values_list("key", "name")
+        context["all_languages"] = get_all_languages()
         context["selected_languages"] = self.selected_languages_key
         context["all_statuses"] = self.get_searchable_status_codes()
         context["selected_statuses"] = self.selected_statuses
         context["can_show_result_data"] = not self.in_hidden_subtasks_contest()
-        context["page_suffix"] = suffix = (
-            ("?" + self.request.GET.urlencode()) if self.request.GET else ""
-        )
-        context["first_page_href"] = (self.first_page_href or ".") + suffix
         context["my_submissions_link"] = self.get_my_submissions_page()
         context["friend_submissions_link"] = self.get_friend_submissions_page()
         context["all_submissions_link"] = self.get_all_submissions_page()
+        context["user_submissions_url_template"] = (
+            self.get_user_submissions_url_template()
+        )
         context["page_type"] = self.page_type
         context["hide_contest_in_row"] = self.hide_contest_in_row()
 
@@ -469,9 +547,34 @@ class SubmissionsListBase(DiggPaginatorMixin, TitleMixin, ListView):
         if context["in_hidden_subtasks_contest"]:
             for submission in context["submissions"]:
                 self.modify_attrs(submission)
-        context[
-            "is_in_editable_contest"
-        ] = self.in_contest and self.contest.is_editable_by(self.request.user)
+        # Per-submission is_result_hidden
+        if self.in_contest and not self.contest.is_editable_by(self.request.user):
+            result_hidden_cp_ids = set(
+                self.contest.contest_problems.filter(
+                    is_result_hidden=True, problem__isnull=False
+                ).values_list("problem_id", flat=True)
+            )
+            if result_hidden_cp_ids:
+                for submission in context["submissions"]:
+                    if submission.problem_id in result_hidden_cp_ids:
+                        setattr(submission, "_is_result_hidden", True)
+                        if submission.status in ("IE", "CE", "AB"):
+                            setattr(
+                                submission, "_result_class", submission.result_class
+                            )
+                        else:
+                            setattr(submission, "_result_class", "TLE")
+        context["is_in_editable_contest"] = (
+            self.in_contest and self.contest.is_editable_by(self.request.user)
+        )
+        # Add pagination context for parameter-based pagination
+        context.update(paginate_query_context(self.request))
+
+        # Prefetch data
+        Profile.get_cached_instances(*[s.user_id for s in context["submissions"]])
+        Problem.prefetch_cache_i18n_name(
+            self.request.LANGUAGE_CODE, *[s.problem_id for s in context["submissions"]]
+        )
 
         return context
 
@@ -503,9 +606,9 @@ class SubmissionsListBase(DiggPaginatorMixin, TitleMixin, ListView):
             response = {}
             if not self.in_hidden_subtasks_contest():
                 response["results_json"] = self.get_result_data()
-                response[
-                    "results_colors_json"
-                ] = settings.DMOJ_STATS_SUBMISSION_RESULT_COLORS
+                response["results_colors_json"] = (
+                    settings.DMOJ_STATS_SUBMISSION_RESULT_COLORS
+                )
             else:
                 response["results_json"] = None
             return JsonResponse(response)
@@ -525,7 +628,7 @@ class UserMixin(object):
                 ContestParticipation, id=kwargs["participation"]
             )
             self.profile = self.participation.user
-            self.username = self.profile.user.username
+            self.username = self.profile.username
         if self.profile == request.profile:
             self.include_frozen = True
         return super(UserMixin, self).get(request, *args, **kwargs)
@@ -538,7 +641,7 @@ class ConditionalUserTabMixin(object):
             context["page_type"] = "my_submissions_tab"
         else:
             context["page_type"] = "user_submissions_tab"
-            context["tab_username"] = self.profile.user.username
+            context["tab_username"] = self.profile.username
         return context
 
 
@@ -590,7 +693,7 @@ class AllFriendSubmissions(
     LoginRequiredMixin, InfinitePaginationMixin, GeneralSubmissions
 ):
     def get_queryset(self):
-        friends = self.request.profile.get_friends()
+        friends = self.request.profile.get_following_ids(True)
         return (
             super(AllFriendSubmissions, self).get_queryset().filter(user_id__in=friends)
         )
@@ -647,7 +750,7 @@ class ProblemSubmissionsBase(SubmissionsListBase):
         else:
             is_own = hasattr(self, "is_own") and self.is_own
             if not is_own and not self.problem.is_accessible_by(
-                request.user, request.in_contest_mode
+                request.user, request.in_contest
             ):
                 raise Http404()
 
@@ -663,6 +766,12 @@ class ProblemSubmissionsBase(SubmissionsListBase):
             "chronological_submissions", kwargs={"problem": self.problem.code}
         )
 
+    def get_user_submissions_url_template(self):
+        return reverse(
+            "user_submissions",
+            kwargs={"problem": self.problem.code, "user": "__username__"},
+        )
+
     def get_context_data(self, **kwargs):
         context = super(ProblemSubmissionsBase, self).get_context_data(**kwargs)
         if self.dynamic_update:
@@ -672,6 +781,7 @@ class ProblemSubmissionsBase(SubmissionsListBase):
         context["best_submissions_link"] = reverse(
             "ranked_submissions", kwargs={"problem": self.problem.code}
         )
+        context["problem"] = self.problem
         return context
 
 
@@ -748,7 +858,7 @@ def single_submission(request, submission_id, show_problem=True):
     )
 
     is_in_editable_contest = False
-    if authenticated and request.in_contest_mode:
+    if authenticated and request.in_contest:
         contest = request.profile.current_contest.contest
         is_in_editable_contest = contest.is_editable_by(request.user)
 
@@ -864,16 +974,49 @@ class ContestSubmissions(
             self.contest.name,
         )
 
+    @cached_property
+    def user_filter(self):
+        return self.request.GET.get("user_filter", "me")
+
+    @cached_property
+    def selected_problem(self):
+        problem_code = self.request.GET.get("problem")
+        if problem_code:
+            try:
+                cp = self.contest.contest_problems.get(problem__code=problem_code)
+                return cp.problem
+            except self.contest.contest_problems.model.DoesNotExist:
+                pass
+        return None
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.user_filter == "me":
+            queryset = queryset.filter(user=self.request.profile)
+        if self.selected_problem:
+            queryset = queryset.filter(problem=self.selected_problem)
+        return queryset
+
     def get_context_data(self, **kwargs):
         self.object = self.contest
         context = super(ContestSubmissions, self).get_context_data(**kwargs)
         context["contest"] = self.contest
         context["page_type"] = "submissions"
+        context["user_filter"] = self.user_filter
+        contest_problem_ids = get_contest_problem_ids(self.contest.id)
+        Problem.prefetch_cache_i18n_name(
+            self.request.LANGUAGE_CODE, *contest_problem_ids
+        )
+        context["contest_problems"] = Problem.get_cached_instances(*contest_problem_ids)
+        context["selected_problem"] = (
+            self.selected_problem.code if self.selected_problem else ""
+        )
         return context
 
 
 class UserContestSubmissions(ForceContestMixin, UserProblemSubmissions):
     check_contest_in_access_check = True
+    template_name = "contest/submissions.html"
 
     def get_title(self):
         if self.problem.is_accessible_by(self.request.user):
@@ -919,11 +1062,28 @@ class UserContestSubmissions(ForceContestMixin, UserProblemSubmissions):
             reverse("contest_view", args=[self.contest.key]),
         )
 
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["contest"] = self.contest
+        context["page_type"] = "submissions"
+        context["can_edit"] = self.contest.is_editable_by(self.request.user)
+        context["can_access"] = self.contest.is_accessible_by(self.request.user)
+        context["now"] = timezone.now()
+        context["user_filter"] = "me"
+        contest_problem_ids = get_contest_problem_ids(self.contest.id)
+        Problem.prefetch_cache_i18n_name(
+            self.request.LANGUAGE_CODE, *contest_problem_ids
+        )
+        context["contest_problems"] = Problem.get_cached_instances(*contest_problem_ids)
+        context["selected_problem"] = self.problem.code
+        return context
+
 
 class UserContestSubmissionsAjax(UserContestSubmissions):
     template_name = "submission/user-ajax.html"
 
     def contest_time(self, s):
+        return None
         if s.contest.participation.live:
             if self.contest.time_limit:
                 return s.date - s.contest.participation.real_start
@@ -952,10 +1112,13 @@ class UserContestSubmissionsAjax(UserContestSubmissions):
             ):
                 if contest_problem.id != problem_id or total_subtask_points == 0:
                     continue
+
                 if not subtask:
                     subtask = 0
+
                 problem_points = pp
                 submission = Submission.objects.get(id=sub_id)
+
                 if subtask in hidden_subtasks.get(
                     str(problem_id), set()
                 ) and not self.contest.is_editable_by(self.request.user):
@@ -966,16 +1129,21 @@ class UserContestSubmissionsAjax(UserContestSubmissions):
                         "total": total_subtask_points,
                     }
                 else:
+                    submission_time = self.contest_time(submission)
+                    if submission_time:
+                        contest_time = nice_repr(submission_time, "noday")
+                    else:
+                        contest_time = None
                     best_subtasks[subtask] = {
                         "submission": submission,
-                        "contest_time": nice_repr(
-                            self.contest_time(submission), "noday"
-                        ),
+                        "contest_time": contest_time,
                         "points": subtask_points,
                         "total": total_subtask_points,
                     }
                     achieved_points += subtask_points
+
                 total_points += total_subtask_points
+
             for subtask in best_subtasks.values():
                 if subtask["points"] != "???":
                     subtask["points"] = floatformat(
@@ -986,9 +1154,11 @@ class UserContestSubmissionsAjax(UserContestSubmissions):
                     subtask["total"] / total_points * problem_points,
                     -self.contest.points_precision,
                 )
+
             if total_points > 0 and best_subtasks:
                 achieved_points = achieved_points / total_points * problem_points
                 return best_subtasks, achieved_points, problem_points
+
         return None
 
     def get_context_data(self, **kwargs):
@@ -1048,15 +1218,11 @@ class UserContestSubmissionsAjax(UserContestSubmissions):
 
 class SubmissionSourceFileView(View):
     def get(self, request, filename):
-        filepath = os.path.join(settings.DMOJ_SUBMISSION_ROOT, filename)
-        if not os.path.exists(filepath):
+        # Redirect to storage URL (works with both local media and S3)
+        storage_path = f"submissions/{filename}"
+        if not default_storage.exists(storage_path):
             raise Http404("File not found")
-        response = HttpResponse()
-        with open(filepath, "rb") as f:
-            response.content = f.read()
-        response["Content-Type"] = "application/octet-stream"
-        response["Content-Disposition"] = "attachment; filename=%s" % (filename,)
-        return response
+        return HttpResponseRedirect(default_storage.url(storage_path))
 
 
 @cache_wrapper(prefix="gsrd", timeout=3600, expected_type=dict)

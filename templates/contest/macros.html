@@ -10,7 +10,7 @@
     {% endif %}
     {% if organization and contest.is_editable %}
       <span class="contest-tag contest-tag-edit">
-        <a href="{{ url('organization_contest_edit', organization.id, organization.slug, contest.key) }}" class="white">
+        <a href="{{ url('contest_edit', contest.key) }}" class="white">
           <i class="fa fa-edit"></i> {{ _('Edit') }}
         </a>
       </span>
@@ -22,8 +22,14 @@
     {% endif %}
     {% if not organization %}
       {% if contest.is_organization_private %}
-        {% for org in contest.organizations.all() %}
+        {% for org in contest.get_organizations() %}
           {% include "organization/tag.html" %}
+        {% endfor %}
+      {% endif %}
+      {% if contest.is_in_course %}
+        {% for cc in contest.course.all() %}
+          {% set course = cc.course %}
+          {% include "course/tag.html" %}
         {% endfor %}
       {% endif %}
     {% endif %}
@@ -34,9 +40,9 @@
     {% endif %}
     {% for tag in contest.tags.all() %}
       <span style="background-color: {{ tag.color }}" class="contest-tag">
-        <a href="{{ url('contest_tag', tag.name) }}"
-          style="color: {{ tag.text_color }}"
-          data-featherlight="{{ url('contest_tag_ajax', tag.name) }}">
+        <a href="{{ url('contest_tag', tag.name) }}" style="color: {{ tag.text_color }}"
+           data-featherlight="{{ url('contest_tag_ajax', tag.name) }}"
+           data-featherlight-variant="contest-tag-lightbox">
           {{- tag.name -}}
         </a>
       </span>
@@ -71,7 +77,8 @@
 
 {% macro user_count(contest, user) %}
   {% if contest.can_see_own_scoreboard(user) %}
-    <a href="{{ url('contest_ranking', contest.key) }}"><i class="fa fa-users"></i> {{ contest.user_count }}</a>
+    <a href="{{ url('contest_ranking', contest.key) }}"><i class="fa fa-users"></i> {{ contest.user_count
+      }}</a>
   {% else %}
     <i class="fa fa-users"></i>{{ contest.user_count }}
   {% endif %}
